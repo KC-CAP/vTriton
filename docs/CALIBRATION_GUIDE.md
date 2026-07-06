@@ -515,3 +515,53 @@ python perfbound/calibration/trace_calibrator.py \
 | `pipe_barrier_cycles_per_iter` | 同步开销 | datasheet seed → **校准** | cycles | ❌ | ✅ **调整** |
 
 **核心原则**：M1 微基准产出的 P0 组件峰值**永不改变**——保证 bound 的保守性。Layer 1/2 只调整"跨组件交互参数"（启动、同步、握手），这些参数在 M1 微基准中无法测量。
+## 2026-07-06 current calibration path
+
+Current HIVM DES modeling should use the v4 910B3 hardware config:
+
+```text
+configs/ascend_910b3_v4.json
+  -> calibration.calib_file
+  -> perfbound/calibration/data/calib_910b3_v4_opcode.json
+```
+
+| File | Current role |
+| --- | --- |
+| `configs/ascend_910b3_v4.json` | Main 910B3 hardware config for C++ `HardwareConfig` |
+| `perfbound/calibration/data/calib_910b3_v4_opcode.json` | v4 opcode/subpipe calibration table; includes scalar ALU and sync lookup refinements |
+| `perfbound/analyze/des_event_wait_analyzer.py` | Generic DES event-wait attribution analyzer and Markdown report generator |
+| `perfbound/calibration/des_trace_postprocessor.py` | Legacy/validation-only; no longer the primary calibration path |
+
+Recommended DES run:
+
+```bash
+./build/bin/tritonsim-hivm \
+  --npuir-file path/to/kernel.npuir.mlir \
+  --scheduler des \
+  --hardware-config configs/ascend_910b3_v4.json \
+  --des-graph-file output/kernel_des.json \
+  --perfetto-trace-file output/kernel_trace.json
+```
+
+Current timing rule:
+
+```text
+block_time_us = critical_path_summary.cycles / (clock_ghz * 1000)
+e2e_ms        = block_time_us * mix_block_num / 1000
+```
+
+`event_wait_cycles`, `critical_path_summary.event_wait_cycles`, and
+`calibration_summary.sync_event_wait_cycles` are attribution fields already
+reflected in DES elapsed start/end timing. Do not add them again to
+`critical_path_summary.cycles` except for an explicit double-count diagnostic.
+
+Generic event-wait report:
+
+```bash
+python3 -m perfbound.analyze.des_event_wait_analyzer \
+  --des output/kernel_des.json \
+  --mix-block-num 205 \
+  --profiling-e2e-ms 104.292 \
+  --title Kernel_DES_Event_Wait_Analysis \
+  --out-md dev_report/kernel_des_event_wait_analysis.md
+```

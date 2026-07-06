@@ -41,6 +41,7 @@ class RealTrace:
     csv_path: str = ""
     n_cores: int = 0
     block_dim: int = 0
+    mix_block_num: int = 0
 
     # Per-task-type aggregates
     aic_total_time_us: float = 0.0
@@ -102,6 +103,7 @@ def extract_real_trace(csv_path: str | Path) -> RealTrace:
 
     trace.n_cores = len(core_timelines)
     trace.block_dim = rows[0].block_dim if rows else 0
+    trace.mix_block_num = rows[0].mix_block_num if rows else 0
 
     for core_id, core_rows in core_timelines.items():
         tl = CoreTimeline(core_id=core_id)
@@ -195,6 +197,8 @@ def _capture_kernel_fields(trace: RealTrace, rows: list) -> None:
     longest = max(candidate_rows, key=lambda r: r.duration_us)
     trace.kernel_wall_time_us = longest.duration_us
     trace.task_type_raw = longest.task_type.strip()
+    trace.block_dim = longest.block_dim
+    trace.mix_block_num = longest.mix_block_num
 
 
 def _compute_concurrency(

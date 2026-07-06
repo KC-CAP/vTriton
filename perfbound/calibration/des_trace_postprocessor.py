@@ -12,6 +12,13 @@ Requires: perfbound/calibration/data/calib_910b3_v3_opcode.json
 import json
 import os
 
+# NOTE(2026-07-06): This module is legacy/validation-only.
+# Mainline HIVM calibration is applied before DES scheduling via
+# configs/ascend_910b3_v4.json ->
+# perfbound/calibration/data/calib_910b3_v4_opcode.json.
+# Post-processing DES duration after scheduling cannot update start/end cycles
+# or dependency ready times, so it must not be used as the primary modeling path.
+
 ROOT = os.environ.get(
     "VTRITON_ROOT",
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

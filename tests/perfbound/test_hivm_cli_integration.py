@@ -29,6 +29,7 @@ HIVM_MIXED_CV_KERNEL = FIXTURE_DIR / "hivm_mixed_cv_kernel.npuir.mlir"
 
 # Hardware config
 HW_CONFIG = PROJECT_ROOT / "configs" / "ascend_910b.json"
+CALIBRATED_HW_CONFIG = PROJECT_ROOT / "configs" / "ascend_910b3_v4.json"
 
 
 # Skip markers
@@ -133,7 +134,9 @@ class TestTritonsimHivmCLI:
             "--npuir-file", str(npuir_file),
             "--des-graph-file", str(out_file),
         ]
-        if HW_CONFIG.exists():
+        if CALIBRATED_HW_CONFIG.exists():
+            cmd.extend(["--hardware-config", str(CALIBRATED_HW_CONFIG)])
+        elif HW_CONFIG.exists():
             cmd.extend(["--hardware-config", str(HW_CONFIG)])
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -179,6 +182,137 @@ class TestTritonsimHivmCLI:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         assert result.returncode != 0
         assert "must be provided together" in result.stderr
+
+    def test_static_scf_for_emits_loop_multiplier_and_diagnostics(self, tmp_path):
+        """Static scf.for trip counts should be resolved and replayed in DES."""
+        source = HIVM_ADD_KERNEL.read_text()
+        source = source.replace(
+            "  %c0 = arith.constant 0 : index\n",
+            (
+                "  %c0 = arith.constant 0 : index\n"
+                "  %c1 = arith.constant 1 : index\n"
+                "  %c4 = arith.constant 4 : index\n"
+            ),
+            1,
+        )
+        loop_start = (
+            "  hivm.hir.vadd ins(%ub0, %ub1 : memref<1024xf32, #hivm.address_space<ub>>,"
+        )
+        source = source.replace(loop_start, "  scf.for %i = %c0 to %c4 step %c1 {\n" + loop_start, 1)
+        loop_end = (
+            "      outs(%ub2 : memref<1024xf32, #hivm.address_space<ub>>)\n"
+        )
+        source = source.replace(loop_end, loop_end + "  }\n", 1)
+
+        npuir_file = tmp_path / "hivm_add_loop.npuir.mlir"
+        npuir_file.write_text(source)
+        out_file = tmp_path / "hivm_add_loop_des.json"
+        cmd = [
+            str(TRITONSIM_HIVM),
+            "--npuir-file", str(npuir_file),
+            "--scheduler", "des",
+            "--des-graph-file", str(out_file),
+        ]
+        if CALIBRATED_HW_CONFIG.exists():
+            cmd.extend(["--hardware-config", str(CALIBRATED_HW_CONFIG)])
+        elif HW_CONFIG.exists():
+            cmd.extend(["--hardware-config", str(HW_CONFIG)])
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, (
+            f"tritonsim-hivm failed (returncode={result.returncode}): "
+            f"{result.stderr[:300]}"
+        )
+
+        data = json.loads(out_file.read_text())
+        ops = data.get("operations", data.get("nodes", []))
+        vadds = [op for op in ops if op.get("name") == "vadd"]
+        assert len(vadds) == 4, "DES should replay the four static loop iterations"
+        assert data.get("loop_diagnostics", {}).get("resolved", 0) >= 1
+        assert "Loops:" in result.stdout
+
+    def test_direct_semantic_scalar_like_ops_are_modeled(self, tmp_path):
+        """Text fallback should not drop arith/affine/memref scalar work."""
+        source = HIVM_ADD_KERNEL.read_text()
+        marker = "  hivm.hir.set_flag[<PIPE_V>, <PIPE_MTE2>, <EVENT_ID0>]\n"
+        scalar_block = (
+            "  %c1_i32 = arith.constant 1 : i32\n"
+            "  %c2_i32 = arith.constant 2 : i32\n"
+            "  %s0 = arith.addi %c1_i32, %c2_i32 : i32\n"
+            "  %s1 = arith.muli %s0, %c2_i32 : i32\n"
+            "  %s2 = arith.cmpi slt, %s0, %s1 : i32\n"
+            "  %s3 = arith.select %s2, %s0, %s1 : i32\n"
+            "  %s4 = arith.index_cast %s3 : i32 to index\n"
+            "  %agu = memref.reinterpret_cast %arg0 to offset: [%s4], sizes: [16], strides: [1]\n"
+            "      : memref<?xf32, #hivm.address_space<gm>>\n"
+            "      to memref<16xf32, strided<[1], offset: ?>, #hivm.address_space<gm>>\n"
+        )
+        assert marker in source
+        npuir_file = tmp_path / "hivm_add_scalar_like.npuir.mlir"
+        npuir_file.write_text(source.replace(marker, scalar_block + marker, 1))
+
+        out_file = tmp_path / "hivm_add_scalar_like_des.json"
+        cmd = [
+            str(TRITONSIM_HIVM),
+            "--npuir-file", str(npuir_file),
+            "--scheduler", "des",
+            "--des-graph-file", str(out_file),
+        ]
+        if CALIBRATED_HW_CONFIG.exists():
+            cmd.extend(["--hardware-config", str(CALIBRATED_HW_CONFIG)])
+        elif HW_CONFIG.exists():
+            cmd.extend(["--hardware-config", str(HW_CONFIG)])
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, (
+            f"tritonsim-hivm failed (returncode={result.returncode}): "
+            f"{result.stderr[:300]}"
+        )
+
+        data = json.loads(out_file.read_text())
+        scalar_ops = [
+            op for op in data.get("operations", [])
+            if op.get("name") in {"addi", "muli", "cmpi", "select", "index_cast", "reinterpret_cast"}
+        ]
+        assert {op["name"] for op in scalar_ops} >= {
+            "addi", "muli", "cmpi", "select", "index_cast", "reinterpret_cast"
+        }
+        assert all(op["pipe"] == "PIPE_S" for op in scalar_ops)
+        assert sum(op["duration"] for op in scalar_ops) > 0
+        assert all(op["calibrated_cost"] for op in scalar_ops)
+
+        summary = data["calibration_summary"]
+        assert summary["calibrated_ops"] >= len(scalar_ops)
+        assert summary["heuristic_ops"] >= 0
+        assert summary["by_subpipe"]["scalar_alu"]["ops"] >= 4
+        assert summary["by_subpipe"]["agu"]["ops"] >= 2
+        assert isinstance(summary["top_unclassified"], list)
+        assert "sync_issue_cycles" in summary
+        assert "sync_event_wait_cycles" in summary
+
+        critical = data["critical_path_summary"]
+        assert critical["cycles"] >= 0
+        assert critical["issue_cycles"] >= 0
+        assert critical["event_wait_cycles"] >= 0
+        assert isinstance(critical["ops"], list)
+
+        sync_ops = [
+            op for op in data.get("operations", [])
+            if op.get("name") in {"set_flag", "wait_flag"}
+        ]
+        assert sync_ops
+        assert all(op["calibrated_cost"] for op in sync_ops)
+        assert {op["cost_subpipe"] for op in sync_ops} == {"sync"}
+        sync_durations = {}
+        for op in sync_ops:
+            sync_durations.setdefault(op["name"], set()).add(op["duration"])
+            assert "event_wait_cycles" in op
+        assert 100 in {op["dependency_latency"] for op in sync_ops if op["name"] == "set_flag"}
+        assert all(
+            op["issue_duration"] <= 32
+            for op in sync_ops
+            if op["name"] == "wait_flag"
+        )
 
 
 @requires_tritonsim_opt

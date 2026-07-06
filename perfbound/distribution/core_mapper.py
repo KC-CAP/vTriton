@@ -74,6 +74,11 @@ class DistributionResult:
 
     total_blocks: int = 0
     grid: Tuple[int, ...] = ()
+    mix_block_num: int = 0
+    blocks_aic: int = 0
+    blocks_aiv: int = 0
+    strategy: str = "paired_block"
+    assumptions: List[str] = field(default_factory=list)
 
     # waves = ceil(total_blocks / effective_cores)
     waves_aic: int = 0
@@ -195,6 +200,9 @@ class CoreMapper:
         per_block_span_aic_us: float = 0.0,
         per_block_span_aiv_us: float = 0.0,
         task_type: str = "MIX_AIC",
+        *,
+        mix_block_num: Optional[int] = None,
+        strategy: str = "paired_block",
     ) -> DistributionResult:
         """Map a grid onto the core array and compute E2E wall clock.
 
@@ -219,9 +227,51 @@ class CoreMapper:
         total_blocks = self._total_blocks(grid_tuple)
         eff_aic, eff_aiv = self._effective_cores(task_type,
                                                   self._aic, self._aiv)
+        tt = task_type.strip().upper()
+        blocks_aic = total_blocks if eff_aic > 0 else 0
+        blocks_aiv = total_blocks if eff_aiv > 0 else 0
+        mix_blocks = int(mix_block_num or 0)
+        strategy_key = strategy.strip().lower()
+        assumptions: List[str] = []
 
-        waves_aic = self._waves(total_blocks, eff_aic) if eff_aic > 0 else 0
-        waves_aiv = self._waves(total_blocks, eff_aiv) if eff_aiv > 0 else 0
+        if tt in _TASK_MIX:
+            if strategy_key == "paired_block":
+                assumptions.append(
+                    "Block Num is treated as logical MIX blocks; each block "
+                    "has one AIC side and one AIV side."
+                )
+            elif strategy_key == "mix_block_total":
+                if mix_blocks <= 0:
+                    raise ValueError(
+                        "mix_block_total strategy requires mix_block_num > 0"
+                    )
+                blocks_aic = total_blocks
+                blocks_aiv = mix_blocks
+                assumptions.append(
+                    "Mix Block Num is treated as the AIV-side runnable block "
+                    "count while Block Num remains the AIC logical block count."
+                )
+            elif strategy_key == "bottleneck_core_count":
+                bottleneck_cores = min(c for c in (eff_aic, eff_aiv) if c > 0)
+                eff_aic = bottleneck_cores if eff_aic > 0 else 0
+                eff_aiv = bottleneck_cores if eff_aiv > 0 else 0
+                assumptions.append(
+                    "MIX launch waves are computed with the smaller active "
+                    "core count for both AIC and AIV sides."
+                )
+            else:
+                raise ValueError(
+                    "unknown CoreMapper strategy "
+                    f"{strategy!r}; expected paired_block, mix_block_total, "
+                    "or bottleneck_core_count"
+                )
+        elif strategy_key != "paired_block":
+            assumptions.append(
+                f"Strategy {strategy_key!r} is ignored for non-MIX task type {tt}."
+            )
+
+        waves_aic = self._waves(blocks_aic, eff_aic) if eff_aic > 0 else 0
+        waves_aiv = self._waves(blocks_aiv, eff_aiv) if eff_aiv > 0 else 0
 
         e2e_aic = waves_aic * per_block_span_aic_us
         e2e_aiv = waves_aiv * per_block_span_aiv_us
@@ -243,6 +293,11 @@ class CoreMapper:
         return DistributionResult(
             total_blocks=total_blocks,
             grid=grid_tuple,
+            mix_block_num=mix_blocks,
+            blocks_aic=blocks_aic,
+            blocks_aiv=blocks_aiv,
+            strategy=strategy_key,
+            assumptions=assumptions,
             waves_aic=waves_aic,
             waves_aiv=waves_aiv,
             per_block_span_aic_us=per_block_span_aic_us,
@@ -255,6 +310,33 @@ class CoreMapper:
             occupancy_pct=occupancy,
             task_type=task_type.strip().upper(),
         )
+
+    def map_alternatives(
+        self,
+        grid: Union[int, Tuple[int, ...], List[int]],
+        per_block_span_aic_us: float = 0.0,
+        per_block_span_aiv_us: float = 0.0,
+        task_type: str = "MIX_AIC",
+        *,
+        mix_block_num: Optional[int] = None,
+    ) -> List[DistributionResult]:
+        """Return auditable Layer0 estimates for plausible MIX strategies."""
+        strategies = ["paired_block"]
+        if task_type.strip().upper() in _TASK_MIX:
+            strategies.append("bottleneck_core_count")
+            if mix_block_num:
+                strategies.append("mix_block_total")
+        return [
+            self.map(
+                grid,
+                per_block_span_aic_us,
+                per_block_span_aiv_us,
+                task_type,
+                mix_block_num=mix_block_num,
+                strategy=strategy,
+            )
+            for strategy in strategies
+        ]
 
     def __repr__(self) -> str:
         return f"CoreMapper(aic={self._aic}, aiv={self._aiv})"

@@ -96,6 +96,7 @@ def run_calibration(
     per_core_results: List[PerCoreResult] = []
     pipeline_results: List[PipelineResult] = []
     distribution_results: List[DistributionResult] = []
+    distribution_alternatives: List[DistributionResult] = []
     kernel_names: List[str] = []
 
     for real_csv, model_trace in zip(real_csvs, model_traces):
@@ -118,11 +119,22 @@ def run_calibration(
             per_block_span_aic_us=model.aic_total_time_us,
             per_block_span_aiv_us=model.aiv_total_time_us,
             task_type=real.task_type_raw or "MIX_AIC",
+            mix_block_num=real.mix_block_num or None,
         )
         distribution_results.append(distribution)
+        distribution_alternatives = mapper.map_alternatives(
+            grid=total_blocks,
+            per_block_span_aic_us=model.aic_total_time_us,
+            per_block_span_aiv_us=model.aiv_total_time_us,
+            task_type=real.task_type_raw or "MIX_AIC",
+            mix_block_num=real.mix_block_num or None,
+        )
 
         print(f"  Layer 0 (Core Dist): {real.block_dim} blocks × "
               f"{aic_cores}AIC+{aiv_cores}AIV")
+        if real.mix_block_num:
+            print(f"    Mix Block Num: {real.mix_block_num}")
+        print(f"    Strategy: {distribution.strategy}")
         print(f"    Waves: AIC={distribution.waves_aic}, AIV={distribution.waves_aiv}")
         print(f"    Model E2E: AIC={distribution.e2e_aic_us:.1f}us  "
               f"AIV={distribution.e2e_aiv_us:.1f}us  "
@@ -185,12 +197,32 @@ def run_calibration(
     if distribution_results:
         dr = distribution_results[0]
         report.adjustments["_layer0_detail"] = {
+            "strategy": dr.strategy,
             "waves_aic": dr.waves_aic,
             "waves_aiv": dr.waves_aiv,
             "bottleneck": dr.bottleneck,
+            "blocks_aic": dr.blocks_aic,
+            "blocks_aiv": dr.blocks_aiv,
+            "mix_block_num": dr.mix_block_num,
             "per_block_span_aic_us": dr.per_block_span_aic_us,
             "per_block_span_aiv_us": dr.per_block_span_aiv_us,
+            "assumptions": dr.assumptions,
         }
+        report.adjustments["_layer0_alternatives"] = [
+            {
+                "strategy": alt.strategy,
+                "blocks_aic": alt.blocks_aic,
+                "blocks_aiv": alt.blocks_aiv,
+                "waves_aic": alt.waves_aic,
+                "waves_aiv": alt.waves_aiv,
+                "e2e_aic_us": alt.e2e_aic_us,
+                "e2e_aiv_us": alt.e2e_aiv_us,
+                "e2e_wall_us": alt.e2e_wall_us,
+                "bottleneck": alt.bottleneck,
+                "assumptions": alt.assumptions,
+            }
+            for alt in distribution_alternatives
+        ]
 
     print_report(report)
 

@@ -22,6 +22,47 @@ using namespace mlir::ascend;
 
 static std::unique_ptr<HardwareConfig> globalConfig;
 
+namespace {
+
+static std::string makeOpcodeCostKey(llvm::StringRef pipeName,
+                                     llvm::StringRef opName) {
+  std::string key = pipeName.str();
+  key.push_back('\001');
+  key += opName.str();
+  return key;
+}
+
+static bool isSyncOpcode(llvm::StringRef opName) {
+  return opName == "set_flag" || opName == "wait_flag" ||
+         opName == "sync_block_set" || opName == "sync_block_wait" ||
+         opName == "sync_block" || opName == "pipe_barrier";
+}
+
+static bool readOpcodeCostObject(const llvm::json::Object &obj,
+                                 OpcodeCycleCost &cost) {
+  if (auto cycles = obj.getNumber("cycles")) {
+    cost.cycles = *cycles;
+    cost.hasCycles = true;
+  }
+  if (auto latency = obj.getNumber("latency")) {
+    cost.latency = *latency;
+    cost.hasLatency = true;
+  }
+  if (auto startup = obj.getNumber("startup_cycles")) {
+    cost.startupCycles = *startup;
+    cost.hasStartupCycles = true;
+  }
+  if (auto cpb = obj.getNumber("cycles_per_byte")) {
+    cost.cyclesPerByte = *cpb;
+    cost.hasCyclesPerByte = true;
+  }
+  if (auto source = obj.getString("source"))
+    cost.source = source->str();
+  return cost.hasCycles || cost.hasStartupCycles || cost.hasCyclesPerByte;
+}
+
+} // namespace
+
 HardwareConfig &mlir::ascend::getHardwareConfig() {
   if (!globalConfig) {
     globalConfig = HardwareConfig::getDefault910B();
@@ -103,7 +144,32 @@ HardwareConfig::loadFromFile(llvm::StringRef path) {
     return nullptr;
   }
 
-  return loadFromJSON(*json);
+  auto config = loadFromJSON(*json);
+  if (!config)
+    return nullptr;
+
+  if (const auto *root = json->getAsObject()) {
+    if (const auto *calibration = root->getObject("calibration")) {
+      if (auto calibFile = calibration->getString("calib_file")) {
+        llvm::SmallString<256> calibPath(*calibFile);
+        if (llvm::sys::path::is_relative(calibPath)) {
+          llvm::SmallString<256> configDir(path);
+          llvm::sys::path::remove_filename(configDir);
+          llvm::SmallString<256> joined(configDir);
+          llvm::sys::path::append(joined, calibPath);
+          if (llvm::sys::fs::exists(joined)) {
+            calibPath = joined;
+          }
+        }
+        std::string error;
+        if (!config->loadOpcodeCalibrationFromFile(calibPath, error)) {
+          llvm::errs() << "Warning: " << error << "\n";
+        }
+      }
+    }
+  }
+
+  return config;
 }
 
 std::unique_ptr<HardwareConfig>
@@ -938,6 +1004,84 @@ bool HardwareConfig::parseJSON(const llvm::json::Value &json,
   return true;
 }
 
+bool HardwareConfig::loadOpcodeCalibrationFromFile(llvm::StringRef path,
+                                                   std::string &error) {
+  auto bufferOrErr = llvm::MemoryBuffer::getFile(path);
+  if (!bufferOrErr) {
+    error = "failed to read opcode calibration file: " + path.str();
+    return false;
+  }
+  auto json = llvm::json::parse(bufferOrErr.get()->getBuffer());
+  if (!json) {
+    error = "failed to parse opcode calibration JSON: " +
+            llvm::toString(json.takeError());
+    return false;
+  }
+  const auto *root = json->getAsObject();
+  if (!root) {
+    error = "opcode calibration root is not a JSON object: " + path.str();
+    return false;
+  }
+  const auto *opcodeCycles = root->getObject("opcode_cycles");
+  if (!opcodeCycles) {
+    error = "opcode calibration missing opcode_cycles: " + path.str();
+    return false;
+  }
+
+  opcodeCycleCosts.clear();
+  opcodeCalibrationPath = path.str();
+  if (auto version = root->getString("_version"))
+    opcodeCalibrationVersion = version->str();
+
+  auto addCost = [&](llvm::StringRef pipeName, llvm::StringRef opName,
+                     OpcodeCycleCost cost) {
+    opcodeCycleCosts[makeOpcodeCostKey(pipeName, opName)] = std::move(cost);
+  };
+
+  for (const auto &pipeKV : *opcodeCycles) {
+    llvm::StringRef pipeName = pipeKV.first;
+    if (pipeName.starts_with("_"))
+      continue;
+    const auto *pipeObj = pipeKV.second.getAsObject();
+    if (!pipeObj)
+      continue;
+
+    for (const auto &opKV : *pipeObj) {
+      llvm::StringRef opName = opKV.first;
+      if (opName.starts_with("_")) {
+        const auto *groupObj = opKV.second.getAsObject();
+        if (!groupObj)
+          continue;
+        std::string subpipe = opName.drop_front(1).str();
+        for (const auto &nestedKV : *groupObj) {
+          llvm::StringRef nestedName = nestedKV.first;
+          if (nestedName.starts_with("_"))
+            continue;
+          const auto *costObj = nestedKV.second.getAsObject();
+          if (!costObj)
+            continue;
+          OpcodeCycleCost cost;
+          if (!readOpcodeCostObject(*costObj, cost))
+            continue;
+          cost.subpipe = subpipe;
+          addCost(pipeName, nestedName, std::move(cost));
+        }
+        continue;
+      }
+
+      const auto *costObj = opKV.second.getAsObject();
+      if (!costObj)
+        continue;
+      OpcodeCycleCost cost;
+      if (!readOpcodeCostObject(*costObj, cost))
+        continue;
+      addCost(pipeName, opName, std::move(cost));
+    }
+  }
+
+  return true;
+}
+
 //===----------------------------------------------------------------------===//
 // Query Methods
 //===----------------------------------------------------------------------===//
@@ -1087,6 +1231,45 @@ int HardwareConfig::getVectorOpCyclesPerInstruction(
   if (opName.starts_with("v"))
     return 5;   // conservative v3 fallback for unmapped vector ops
   return 1;     // non-vector, don't guess
+}
+
+std::optional<OpcodeCycleCost>
+HardwareConfig::lookupOpcodeCycleCost(llvm::StringRef pipeName,
+                                      llvm::StringRef opName) const {
+  auto findCost = [&](llvm::StringRef pipe,
+                      llvm::StringRef name) -> const OpcodeCycleCost * {
+    auto it = opcodeCycleCosts.find(makeOpcodeCostKey(pipe, name));
+    return it == opcodeCycleCosts.end() ? nullptr : &it->second;
+  };
+
+  if (const OpcodeCycleCost *cost = findCost(pipeName, opName))
+    return *cost;
+
+  // Synchronization opcodes execute on different producer/consumer pipes, but
+  // their cycle model is semantic sync/control cost rather than the data pipe's
+  // vector or MTE transfer model.  Look these up in PIPE_S._sync before any
+  // broad pipe fallback such as MTE startup cost.
+  if (isSyncOpcode(opName)) {
+    if (const OpcodeCycleCost *cost = findCost("PIPE_S", opName))
+      return *cost;
+  }
+
+  if (pipeName == "PIPE_ALL" || pipeName == "PIPE_UNKNOWN") {
+    if (const OpcodeCycleCost *cost = findCost("PIPE_S", opName))
+      return *cost;
+  }
+
+  if (pipeName.starts_with("PIPE_MTE") || pipeName == "PIPE_FIX") {
+    if (const OpcodeCycleCost *cost = findCost("MTE", pipeName))
+      return *cost;
+  }
+
+  if (pipeName == "PIPE_V") {
+    if (const OpcodeCycleCost *cost = findCost("PIPE_V", "_default"))
+      return *cost;
+  }
+
+  return std::nullopt;
 }
 
 int HardwareConfig::getSyncOpCycles(llvm::StringRef opName,

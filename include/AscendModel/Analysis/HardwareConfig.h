@@ -156,6 +156,22 @@ struct CubeModelConfig {
   int l0TileLimitKb = 32;
 };
 
+/// Optional per-HIVM-opcode cost loaded from the v3 opcode calibration table.
+/// ``cycles`` is the pipe issue/resource occupancy. ``latency`` is the
+/// dependency-visible delay; when absent it defaults to ``cycles``.
+struct OpcodeCycleCost {
+  double cycles = 0.0;
+  double latency = 0.0;
+  double startupCycles = 0.0;
+  double cyclesPerByte = 0.0;
+  bool hasCycles = false;
+  bool hasLatency = false;
+  bool hasStartupCycles = false;
+  bool hasCyclesPerByte = false;
+  std::string source;
+  std::string subpipe;
+};
+
 //===----------------------------------------------------------------------===//
 // Pipeline Stage
 //===----------------------------------------------------------------------===//
@@ -230,6 +246,15 @@ public:
   int getVectorWidthBytes() const;
   llvm::StringRef getVectorComputeSpace() const;
   int getVectorOpCyclesPerInstruction(llvm::StringRef opName) const;
+  std::optional<OpcodeCycleCost>
+  lookupOpcodeCycleCost(llvm::StringRef pipeName,
+                        llvm::StringRef opName) const;
+  llvm::StringRef getOpcodeCalibrationVersion() const {
+    return opcodeCalibrationVersion;
+  }
+  llvm::StringRef getOpcodeCalibrationPath() const {
+    return opcodeCalibrationPath;
+  }
   // Inter-pipe sync op cost (cycles) from calibration.sync_op_cycles, or the
   // supplied conservative default when the config omits the entry.
   int getSyncOpCycles(llvm::StringRef opName, int defaultCycles) const;
@@ -335,6 +360,7 @@ public:
 
 private:
   bool parseJSON(const llvm::json::Value &json, std::string &error);
+  bool loadOpcodeCalibrationFromFile(llvm::StringRef path, std::string &error);
 
   /// Populate the tilesim-migrated tables with 910B1 measured values
   /// (hardcoded-fallback path; JSON is authoritative in production).
@@ -352,6 +378,9 @@ private:
   llvm::StringMap<PipelinePath> pipelinePaths;
   llvm::StringMap<int> vectorOpCyclesPerInstruction;
   llvm::StringMap<int> syncOpCycles;
+  llvm::StringMap<OpcodeCycleCost> opcodeCycleCosts;
+  std::string opcodeCalibrationVersion;
+  std::string opcodeCalibrationPath;
 
   // Parallelism info
   llvm::StringMap<bool> parallelismFlags;

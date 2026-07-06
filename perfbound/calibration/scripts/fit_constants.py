@@ -75,6 +75,7 @@ class MSProfRow:
     aicore_time_us: float = 0.0   # from aicore_time(us) column (MIX tasks)
     aiv_time_us: float = 0.0      # from aiv_time(us) column (MIX tasks)
     block_dim: int = 0
+    mix_block_num: int = 0
 
 
 def read_msprof_csv(csv_path: Path) -> List[MSProfRow]:
@@ -139,6 +140,11 @@ def read_msprof_csv(csv_path: Path) -> List[MSProfRow]:
                     block_dim=int(float(_first_present(
                         line,
                         ["Block Dim", "Block Num", "block_dim"],
+                        "0",
+                    ))),
+                    mix_block_num=int(float(_first_present(
+                        line,
+                        ["Mix Block Num", "mix_block_num"],
                         "0",
                     ))),
                 )

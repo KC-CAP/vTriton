@@ -54,6 +54,12 @@ struct HIVMOp {
   std::string coreType;
   std::string eventId;
   int64_t eventGeneration = 0;
+  // Cycles for which this op occupies its execution pipe.  Kept separate
+  // from dependencyLatency so deep-pipelined ops can issue frequently while
+  // making their result visible later.
+  int64_t issueDuration = 0;
+  int64_t dependencyLatency = 0;
+  int64_t eventWaitCycles = 0;
   int64_t duration = 0;
   int64_t bytes = 0;
   // Contiguous transfer packet size in bytes for MTE ops: the largest run the
@@ -67,6 +73,8 @@ struct HIVMOp {
   int64_t flops = 0;
   int64_t multiBufferSlots = 1;
   int64_t startCycle = 0;
+  int64_t resourceReleaseCycle = 0;
+  int64_t valueReadyCycle = 0;
   int64_t endCycle = 0;
   int64_t loopMultiplier = 1;
   int lineNumber = 0;
@@ -77,11 +85,31 @@ struct HIVMOp {
   std::string elemType;  // element type: "f16", "bf16", "f32", "i32", etc.
   int64_t repeat = 1;    // CCE repeat count (>1 = op iterates internally; Gap 4)
   int64_t mask = 0;      // mask lanes disabled (0 = all lanes active; Gap 4)
+  bool calibratedCost = false;
+  std::string costSource;
+  std::string costSubpipe;
   std::vector<std::string> readBuffers;
   std::vector<std::string> writeBuffers;
   std::vector<int64_t> readBufferVersions;
   std::vector<int64_t> writeBufferVersions;
   std::vector<size_t> dependsOn;
+  std::vector<size_t> eventDependsOn;
+};
+
+struct HIVMLoopDiagnostic {
+  int lineNumber = 0;
+  int64_t lowerBound = 0;
+  int64_t upperBound = 0;
+  int64_t step = 0;
+  int64_t tripCount = 1;
+  int64_t multiplier = 1;
+  bool resolved = false;
+};
+
+struct HIVMCostStat {
+  size_t ops = 0;
+  int64_t cycles = 0;
+  int64_t weightedCycles = 0;
 };
 
 struct HIVMAnalysisReport {
@@ -92,15 +120,35 @@ struct HIVMAnalysisReport {
   int64_t weightedCycles = 0;
   int64_t totalBusyCycles = 0;
   int64_t syncCycles = 0;
+  int64_t syncIssueCycles = 0;
+  int64_t syncEventWaitCycles = 0;
+  int64_t criticalPathCycles = 0;
+  int64_t criticalPathIssueCycles = 0;
+  int64_t criticalPathEventWaitCycles = 0;
   int64_t barrierCycles = 0;
   size_t opCount = 0;
   size_t syncOpCount = 0;
   size_t barrierCount = 0;
   size_t unknownOpCount = 0;
+  size_t calibratedOpCount = 0;
+  size_t heuristicOpCount = 0;
+  int64_t calibratedCycles = 0;
+  int64_t heuristicCycles = 0;
+  int64_t calibratedWeightedCycles = 0;
+  int64_t heuristicWeightedCycles = 0;
   int64_t maxLoopMultiplier = 1;
+  size_t loopCount = 0;
+  size_t resolvedLoopCount = 0;
+  size_t unresolvedLoopCount = 0;
+  int64_t maxLoopTripCount = 1;
   bool scheduleTruncated = false; ///< true if DES scheduler hit maxIterations
   std::map<HIVMPipe, int64_t> pipeBusyCycles;
   std::map<HIVMPipe, int64_t> weightedPipeCycles;
+  std::map<std::string, HIVMCostStat> costSourceStats;
+  std::map<std::string, HIVMCostStat> costSubpipeStats;
+  std::map<std::string, HIVMCostStat> unclassifiedCostStats;
+  std::vector<HIVMLoopDiagnostic> loopDiagnostics;
+  std::vector<size_t> criticalPathOps;
   std::vector<HIVMOp> operations;
 
   void print(llvm::raw_ostream &os, const HardwareConfig &config) const;

@@ -783,3 +783,33 @@ C++ 和 Python 层通过 **JSON 序列化** 进行通信：
 ---
 
 > 本报告基于 2026-06-09 的 `HEAD` 初版生成，并于 2026-06-27 更新至 commit `4a63cc2`（US-SB-006 绝对 Gap-2 闭合、US-SB-008 双限硬件验证、负载校准模块、occupancy-aware HBM 与 vector-floor soundness 修复）。A.0–A.8 已完成，Part B（实验 / 迭代校准 / 论文）进行中。
+## 2026-07-06 update: current calibrated HIVM path
+
+The current calibrated HIVM DES path is:
+
+```text
+NPUIR .npuir.mlir
+  -> tritonsim-hivm --scheduler des --hardware-config configs/ascend_910b3_v4.json
+  -> DES JSON + Perfetto trace
+  -> perfbound.analyze.des_event_wait_analyzer
+  -> per-kernel event-wait attribution report
+```
+
+Current hardware/calibration files:
+
+| File | Role |
+| --- | --- |
+| `configs/ascend_910b3_v4.json` | Active 910B3 hardware config for DES modeling |
+| `perfbound/calibration/data/calib_910b3_v4_opcode.json` | Active opcode/subpipe calibration table |
+| `perfbound/analyze/des_event_wait_analyzer.py` | Generic DES wait attribution and report generator |
+
+DES elapsed timing is authoritative for single-block time:
+
+```text
+block_time_us = critical_path_summary.cycles / (clock_ghz * 1000)
+e2e_ms        = block_time_us * mix_block_num / 1000
+```
+
+`event_wait_cycles` and `critical_path_summary.event_wait_cycles` are
+attribution fields inside the elapsed DES critical path. They are not added to
+elapsed time unless intentionally producing a double-count diagnostic.
