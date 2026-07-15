@@ -828,7 +828,19 @@ bool HardwareConfig::parseJSON(const llvm::json::Value &json,
     }
   }
 
+  auto readCostModelParams = [&](const llvm::json::Object *params) {
+    if (!params)
+      return;
+    for (const auto &kv : *params) {
+      if (auto value = kv.second.getAsNumber())
+        costModelParams[kv.first.str()] = *value;
+    }
+  };
+
   if (const auto *calibration = root->getObject("calibration")) {
+    readCostModelParams(calibration->getObject("cost_model_params"));
+    readCostModelParams(calibration->getObject("tilemix_cost_model_params"));
+
     if (const auto *vecOps =
             calibration->getObject("vector_op_cycles_per_vec_instruction")) {
       auto readInt = [&](llvm::StringRef key, llvm::StringRef opName) {
@@ -870,6 +882,11 @@ bool HardwareConfig::parseJSON(const llvm::json::Value &json,
       }
     }
   }
+
+  readCostModelParams(root->getObject("cost_model_params"));
+  readCostModelParams(root->getObject("costmodel_params"));
+  if (const auto *costModel = root->getObject("cost_model"))
+    readCostModelParams(costModel->getObject("params"));
 
   //===------------------------------------------------------------------===//
   // tilesim-migrated micro-architecture tables (root cause ①/②)
@@ -1278,6 +1295,22 @@ int HardwareConfig::getSyncOpCycles(llvm::StringRef opName,
   if (it != syncOpCycles.end())
     return it->second;
   return defaultCycles;
+}
+
+double HardwareConfig::getCostModelParam(llvm::StringRef name,
+                                         double defaultValue) const {
+  auto it = costModelParams.find(name);
+  if (it != costModelParams.end())
+    return it->second;
+  return defaultValue;
+}
+
+int64_t HardwareConfig::getCostModelIntParam(llvm::StringRef name,
+                                             int64_t defaultValue) const {
+  auto it = costModelParams.find(name);
+  if (it != costModelParams.end())
+    return static_cast<int64_t>(std::llround(it->second));
+  return defaultValue;
 }
 
 double HardwareConfig::getHBMBandwidthGBs() const {

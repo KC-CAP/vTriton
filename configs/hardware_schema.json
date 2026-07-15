@@ -130,6 +130,30 @@
     "performance_model": {
       "type": "object",
       "description": "Custom performance estimation formulas"
+    },
+
+    "calibration": {
+      "type": "object",
+      "description": "Profiling-derived model parameters for this hardware generation",
+      "properties": {
+        "cost_model_params": {
+          "type": "object",
+          "description": "Named coefficients used by optional cost-model features such as tilemix",
+          "additionalProperties": { "type": "number" }
+        },
+        "tilemix_cost_model_params": {
+          "type": "object",
+          "description": "Alias for tilemix-specific cost-model coefficients",
+          "additionalProperties": { "type": "number" }
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "cost_model_params": {
+      "type": "object",
+      "description": "Top-level named cost-model coefficients",
+      "additionalProperties": { "type": "number" }
     }
   }
 }

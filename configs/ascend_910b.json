@@ -185,6 +185,25 @@
   "calibration": {
     "description": "Parameters calibrated from _attn_fwd (flash attention) profiling on Ascend 910B. Input: Z=1,H=8,N_CTX=192,HEAD_DIM=128. BLOCK_M in {16,32,48,64}, BLOCK_N=64 fixed. Hardware: Block Dim=20 (AIC) + 20 AIV = Mix Block Dim 40.",
 
+    "cost_model_params": {
+      "tilemix_buffer_target_fraction": 0.125,
+      "tilemix_pressure_granularity_fraction": 0.125,
+      "tilemix_handoff_local_target_fraction": 0.125,
+      "tilemix_handoff_max_relief_ratio": 0.25,
+      "tilemix_handoff_max_log2_steps": 1.0,
+      "tilemix_handoff_tensor_count": 2.0,
+      "tilemix_intermediate_ub_target_fraction": 0.125,
+      "tilemix_intermediate_dtype_bytes": 4.0,
+      "tilemix_intermediate_pressure_penalty_ratio": 0.18,
+      "tilemix_intermediate_pressure_max_log2_steps": 1.0,
+      "tilemix_loop_granularity_relief_ratio": 0.02,
+      "tilemix_loop_granularity_max_log2_steps": 2.0,
+      "tilemix_loop_mismatch_penalty_ratio": 0.01,
+      "tilemix_sync_frequency_penalty_ratio": 0.01,
+      "tilemix_sync_neutral_segments": 4.0,
+      "tilemix_sync_penalty_segments": 8.0
+    },
+
     "startup_latencies": {
       "vector_startup_cycles": 35,
       "mte2_startup_cycles": 50,
