@@ -125,7 +125,25 @@ mlir::ascend::loadHardwareConfigForAnalysis(llvm::StringRef path,
 // HardwareConfig Implementation
 //===----------------------------------------------------------------------===//
 
-HardwareConfig::HardwareConfig() : clockFreqGHz(1.0) {}
+HardwareConfig::HardwareConfig() : clockFreqGHz(1.0) {
+  // Fallbacks for legacy configs. Production calibration should override these
+  // through calibration.cost_model_params in the hardware JSON.
+  costModelParams["tilemix_buffer_target_fraction"] = 0.125;
+  costModelParams["tilemix_pressure_granularity_fraction"] = 0.125;
+  costModelParams["tilemix_handoff_local_target_fraction"] = 0.125;
+  costModelParams["tilemix_handoff_max_relief_ratio"] = 0.25;
+  costModelParams["tilemix_handoff_max_log2_steps"] = 1.0;
+  costModelParams["tilemix_intermediate_ub_target_fraction"] = 0.125;
+  costModelParams["tilemix_intermediate_dtype_bytes"] = 4.0;
+  costModelParams["tilemix_intermediate_pressure_penalty_ratio"] = 0.0;
+  costModelParams["tilemix_intermediate_pressure_max_log2_steps"] = 1.0;
+  costModelParams["tilemix_loop_granularity_relief_ratio"] = 0.0;
+  costModelParams["tilemix_loop_granularity_max_log2_steps"] = 2.0;
+  costModelParams["tilemix_loop_mismatch_penalty_ratio"] = 0.0;
+  costModelParams["tilemix_sync_frequency_penalty_ratio"] = 0.01;
+  costModelParams["tilemix_sync_neutral_segments"] = 4.0;
+  costModelParams["tilemix_sync_penalty_segments"] = 8.0;
+}
 
 HardwareConfig::~HardwareConfig() = default;
 
@@ -1250,6 +1268,22 @@ int HardwareConfig::getVectorOpCyclesPerInstruction(
   return 1;     // non-vector, don't guess
 }
 
+double HardwareConfig::getCostModelParam(llvm::StringRef name,
+                                         double defaultValue) const {
+  auto it = costModelParams.find(name);
+  if (it != costModelParams.end())
+    return it->second;
+  return defaultValue;
+}
+
+int64_t HardwareConfig::getCostModelIntParam(llvm::StringRef name,
+                                             int64_t defaultValue) const {
+  auto it = costModelParams.find(name);
+  if (it != costModelParams.end())
+    return static_cast<int64_t>(std::llround(it->second));
+  return defaultValue;
+}
+
 std::optional<OpcodeCycleCost>
 HardwareConfig::lookupOpcodeCycleCost(llvm::StringRef pipeName,
                                       llvm::StringRef opName) const {
@@ -1295,22 +1329,6 @@ int HardwareConfig::getSyncOpCycles(llvm::StringRef opName,
   if (it != syncOpCycles.end())
     return it->second;
   return defaultCycles;
-}
-
-double HardwareConfig::getCostModelParam(llvm::StringRef name,
-                                         double defaultValue) const {
-  auto it = costModelParams.find(name);
-  if (it != costModelParams.end())
-    return it->second;
-  return defaultValue;
-}
-
-int64_t HardwareConfig::getCostModelIntParam(llvm::StringRef name,
-                                             int64_t defaultValue) const {
-  auto it = costModelParams.find(name);
-  if (it != costModelParams.end())
-    return static_cast<int64_t>(std::llround(it->second));
-  return defaultValue;
 }
 
 double HardwareConfig::getHBMBandwidthGBs() const {

@@ -136,7 +136,7 @@ def PipelineAnalysisPass : Pass<"analyze-pipeline", "ModuleOp"> {
            "Path to hardware configuration JSON file">,
     Option<"compileParamsStr", "compile-params", "std::string",
            /*default=*/"\"\"",
-           "Compile-time config parameters for TTIR-only models (e.g., 'BLOCK_M=32,BLOCK_N=128,tile_mix_vector_loop=4')">,
+           "Compile-time parameters for costmodel adjustments (e.g., 'tile_mix_vector_loop=4,tile_mix_cube_loop=2')">,
     Option<"dependencyGraphFile", "dependency-graph-file", "std::string",
            /*default=*/"\"\"",
            "Path to write dependency graph JSON (empty = do not write)">,

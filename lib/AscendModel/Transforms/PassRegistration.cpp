@@ -47,7 +47,14 @@ struct AscendPerfModelPipelineOptions
       *this, "hardware-config",
       llvm::cl::desc("Path to hardware configuration JSON file"),
       llvm::cl::init("")};
-  
+
+  /// Compile-time parameters that affect scheduling but are not visible in TTIR.
+  /// Format: "tile_mix_vector_loop=4,tile_mix_cube_loop=2"
+  PassOptions::Option<std::string> compileParams{
+      *this, "compile-params",
+      llvm::cl::desc("Compile-time params for costmodel adjustments"),
+      llvm::cl::init("")};
+
   /// Enable tiling optimization search.
   PassOptions::Option<bool> optimizeTiling{
       *this, "optimize-tiling",
@@ -106,6 +113,7 @@ void registerAscendModelPipeline() {
           pipelineOpts.argBindingsStr = options.argBindings;
           pipelineOpts.loopTripCountsStr = options.loopTripCounts;
           pipelineOpts.hardwareConfigPath = options.hardwareConfig;
+          pipelineOpts.compileParamsStr = options.compileParams;
           pm.addPass(createPipelineAnalysisPass(pipelineOpts));
         }
         

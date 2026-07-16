@@ -18,12 +18,16 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace mlir {
 namespace ascend {
@@ -41,14 +45,8 @@ using utils::parseLoopTripCounts;
 
 struct TileMixParams {
   bool hasAny = false;
-  int64_t blockM = 0;
-  int64_t blockN = 0;
   int64_t vectorLoop = 0;
   int64_t cubeLoop = 0;
-  int64_t qkDim = 0;
-  int64_t vDim = 0;
-  int64_t headDim = 0;
-  int64_t dtypeBytes = 0;
 };
 
 struct TileMixModelConfig {
@@ -58,7 +56,6 @@ struct TileMixModelConfig {
   double intermediateTargetFraction = 1.0;
   double handoffMaxReliefRatio = 0.0;
   double handoffMaxLog2Steps = 1.0;
-  int64_t handoffTensorCount = 1;
   double intermediateDtypeBytes = 0.0;
   double intermediatePressurePenaltyRatio = 0.0;
   double intermediatePressureMaxLog2Steps = 1.0;
@@ -80,6 +77,19 @@ struct TileMixHandoffEstimate {
   int64_t intermediateTileBytes = 0;
   int64_t intermediateTargetBytes = 0;
   int64_t neutralBlockM = 0;
+};
+
+struct TileMixDerivedFeatures {
+  int64_t tileM = 0;
+  int64_t tileN = 0;
+  int64_t dtypeBytes = 0;
+  int64_t handoffTileBytes = 0;
+  int64_t handoffFeatureDim = 0;
+  int64_t intermediateTileBytes = 0;
+  std::string tileShapeSource = "none";
+  std::string dtypeSource = "none";
+  std::string handoffSource = "none";
+  std::string intermediateSource = "none";
 };
 
 struct TileMixBalanceStats {
@@ -104,6 +114,8 @@ struct TileMixBalanceStats {
   int64_t vectorSubtileBytes = 0;
   int64_t cubeTargetBytes = 0;
   int64_t vectorTargetBytes = 0;
+  int64_t inferredTileM = 0;
+  int64_t inferredTileN = 0;
   int64_t handoffFeatureDim = 0;
   int64_t handoffDtypeBytes = 0;
   int64_t handoffTileBytes = 0;
@@ -117,6 +129,10 @@ struct TileMixBalanceStats {
   int64_t loopMismatchPenaltyCycles = 0;
   int64_t bufferFitPenaltyCycles = 0;
   int64_t syncFrequencyPenaltyCycles = 0;
+  std::string tileShapeSource = "none";
+  std::string dtypeSource = "none";
+  std::string handoffSource = "none";
+  std::string intermediateSource = "none";
 };
 
 enum class TileMixPath { None = 0, Cube = 1, Vector = 2 };
@@ -146,30 +162,12 @@ TileMixParams parseTileMixParams(llvm::StringRef compileParamsStr) {
     llvm::StringRef key = kv.first.trim();
     llvm::StringRef value = kv.second.trim();
     int64_t parsed = 0;
-    if ((key == "BLOCK_M" || key == "block_m") &&
-        parsePositiveInt(value, parsed)) {
-      params.blockM = parsed;
-    } else if ((key == "BLOCK_N" || key == "block_n") &&
-               parsePositiveInt(value, parsed)) {
-      params.blockN = parsed;
-    } else if (key == "tile_mix_vector_loop" && parsePositiveInt(value, parsed)) {
+    if (key == "tile_mix_vector_loop" && parsePositiveInt(value, parsed)) {
       params.vectorLoop = parsed;
       params.hasAny = true;
     } else if (key == "tile_mix_cube_loop" && parsePositiveInt(value, parsed)) {
       params.cubeLoop = parsed;
       params.hasAny = true;
-    } else if ((key == "QK_DIM" || key == "qk_dim") &&
-               parsePositiveInt(value, parsed)) {
-      params.qkDim = parsed;
-    } else if ((key == "V_DIM" || key == "v_dim") &&
-               parsePositiveInt(value, parsed)) {
-      params.vDim = parsed;
-    } else if ((key == "HEAD_DIM" || key == "head_dim") &&
-               parsePositiveInt(value, parsed)) {
-      params.headDim = parsed;
-    } else if ((key == "DTYPE_BYTES" || key == "dtype_bytes") &&
-               parsePositiveInt(value, parsed)) {
-      params.dtypeBytes = parsed;
     }
   }
   return params;
@@ -243,9 +241,6 @@ TileMixModelConfig getTileMixModelConfig(const HardwareConfig &config) {
       "tilemix_handoff_max_relief_ratio", model.handoffMaxReliefRatio);
   model.handoffMaxLog2Steps = readPositive(
       "tilemix_handoff_max_log2_steps", model.handoffMaxLog2Steps);
-  model.handoffTensorCount = std::max<int64_t>(
-      1, config.getCostModelIntParam("tilemix_handoff_tensor_count",
-                                     model.handoffTensorCount));
   model.intermediateDtypeBytes = readNonNegative(
       "tilemix_intermediate_dtype_bytes", model.intermediateDtypeBytes);
   model.intermediatePressurePenaltyRatio = readNonNegative(
@@ -290,51 +285,179 @@ int64_t minPositiveLocalBytes(int64_t lhs, int64_t rhs) {
   return std::min(lhs, rhs);
 }
 
-int64_t tileMixHandoffFeatureDim(const TileMixParams &params,
-                                 const TileMixModelConfig &model) {
-  if (params.qkDim > 0 || params.vDim > 0) {
-    int64_t qkDim = params.qkDim > 0 ? params.qkDim : params.headDim;
-    int64_t vDim = params.vDim > 0 ? params.vDim : params.headDim;
-    return std::max<int64_t>(0, qkDim) + std::max<int64_t>(0, vDim);
-  }
-  if (params.headDim > 0)
-    return params.headDim * std::max<int64_t>(model.handoffTensorCount, 1);
+int64_t getElementByteWidth(Type type) {
+  if (auto shaped = dyn_cast<ShapedType>(type))
+    type = shaped.getElementType();
+  if (type.isIntOrFloat())
+    return (type.getIntOrFloatBitWidth() + 7) / 8;
+  if (type.isIndex())
+    return 8;
   return 0;
 }
 
+int64_t getStaticShapedTypeBytes(Type type) {
+  auto shaped = dyn_cast<ShapedType>(type);
+  if (!shaped || !shaped.hasStaticShape())
+    return 0;
+  int64_t elemBytes = getElementByteWidth(shaped.getElementType());
+  if (elemBytes <= 0)
+    return 0;
+  int64_t elements = 1;
+  for (int64_t dim : shaped.getShape())
+    elements *= dim;
+  return elements * elemBytes;
+}
+
+void updateTopTwoLoads(int64_t bytes, int64_t dtypeBytes,
+                       int64_t &top1Bytes, int64_t &top1DtypeBytes,
+                       int64_t &top2Bytes, int64_t &top2DtypeBytes) {
+  if (bytes <= 0)
+    return;
+  if (bytes > top1Bytes) {
+    top2Bytes = top1Bytes;
+    top2DtypeBytes = top1DtypeBytes;
+    top1Bytes = bytes;
+    top1DtypeBytes = dtypeBytes;
+    return;
+  }
+  if (bytes > top2Bytes) {
+    top2Bytes = bytes;
+    top2DtypeBytes = dtypeBytes;
+  }
+}
+
+TileMixDerivedFeatures inferTileMixDerivedFeatures(
+    const PipelineScheduler &scheduler) {
+  TileMixDerivedFeatures features;
+  int64_t topVectorLoadBytes = 0;
+  int64_t topVectorLoadDtypeBytes = 0;
+  int64_t secondVectorLoadBytes = 0;
+  int64_t secondVectorLoadDtypeBytes = 0;
+  int64_t maxBoundaryBytes = 0;
+  int64_t maxBoundaryDtypeBytes = 0;
+  int64_t maxMatmulResultBytes = 0;
+
+  for (const auto &op : scheduler.getAllOps()) {
+    if (!op.mlirOp)
+      continue;
+
+    if (auto matmulOp = dyn_cast<MatmulOp>(op.mlirOp)) {
+      if (matmulOp.getM() > 0 && matmulOp.getN() > 0) {
+        features.tileM = std::max<int64_t>(features.tileM, matmulOp.getM());
+        features.tileN = std::max<int64_t>(features.tileN, matmulOp.getN());
+        features.tileShapeSource = "matmul_attrs";
+      }
+      int64_t lhsDtypeBytes = getElementByteWidth(matmulOp.getLhs().getType());
+      if (lhsDtypeBytes > 0 && features.dtypeBytes <= 0) {
+        features.dtypeBytes = lhsDtypeBytes;
+        features.dtypeSource = "matmul_lhs_type";
+      }
+      int64_t resultBytes =
+          getStaticShapedTypeBytes(matmulOp->getResult(0).getType());
+      if (resultBytes > maxMatmulResultBytes) {
+        maxMatmulResultBytes = resultBytes;
+        features.intermediateTileBytes = resultBytes;
+        features.intermediateSource = "matmul_result_type";
+      }
+      continue;
+    }
+
+    if (auto loadOp = dyn_cast<VectorLoadOp>(op.mlirOp)) {
+      int64_t bytes = std::max<int64_t>(loadOp.getTransferBytes(), 0);
+      int64_t dtypeBytes =
+          getElementByteWidth(loadOp->getResult(0).getType());
+      Operation *sourceDef = loadOp.getSource().getDefiningOp();
+      if (sourceDef && isa<MatmulOp>(sourceDef)) {
+        if (bytes > maxBoundaryBytes) {
+          maxBoundaryBytes = bytes;
+          maxBoundaryDtypeBytes = dtypeBytes;
+        }
+      } else {
+        updateTopTwoLoads(bytes, dtypeBytes, topVectorLoadBytes,
+                          topVectorLoadDtypeBytes, secondVectorLoadBytes,
+                          secondVectorLoadDtypeBytes);
+      }
+      continue;
+    }
+
+    if (auto storeOp = dyn_cast<CubeStoreOp>(op.mlirOp)) {
+      int64_t bytes = std::max<int64_t>(storeOp.getTransferBytes(), 0);
+      int64_t dtypeBytes = getElementByteWidth(storeOp.getData().getType());
+      if (bytes > maxBoundaryBytes) {
+        maxBoundaryBytes = bytes;
+        maxBoundaryDtypeBytes = dtypeBytes;
+      }
+    }
+  }
+
+  if (topVectorLoadBytes > 0) {
+    features.handoffTileBytes = topVectorLoadBytes + secondVectorLoadBytes;
+    features.handoffSource =
+        secondVectorLoadBytes > 0 ? "vector_load_top2" : "vector_load_top1";
+    if (topVectorLoadDtypeBytes > 0) {
+      features.dtypeBytes = topVectorLoadDtypeBytes;
+      features.dtypeSource = "vector_load_type";
+    } else if (secondVectorLoadDtypeBytes > 0 && features.dtypeBytes <= 0) {
+      features.dtypeBytes = secondVectorLoadDtypeBytes;
+      features.dtypeSource = "vector_load_type";
+    }
+  } else if (maxBoundaryBytes > 0) {
+    features.handoffTileBytes = maxBoundaryBytes;
+    features.handoffSource = "cube_vector_boundary";
+    if (maxBoundaryDtypeBytes > 0 && features.dtypeBytes <= 0) {
+      features.dtypeBytes = maxBoundaryDtypeBytes;
+      features.dtypeSource = "boundary_type";
+    }
+  }
+
+  if (features.intermediateTileBytes <= 0 && maxBoundaryBytes > 0) {
+    features.intermediateTileBytes = maxBoundaryBytes;
+    features.intermediateSource = "cube_vector_boundary";
+  }
+
+  if (features.handoffTileBytes > 0 && features.tileN > 0 &&
+      features.dtypeBytes > 0) {
+    int64_t bytesPerTileN = features.tileN * features.dtypeBytes;
+    if (bytesPerTileN > 0)
+      features.handoffFeatureDim =
+          std::max<int64_t>(1, features.handoffTileBytes / bytesPerTileN);
+  }
+
+  return features;
+}
+
 TileMixHandoffEstimate estimateTileMixHandoffRelief(
-    int64_t baseCycles, const TileMixParams &params,
+    int64_t baseCycles, const TileMixDerivedFeatures &features,
     const TileMixModelConfig &model, int64_t l0cBytes, int64_t ubBytes) {
   TileMixHandoffEstimate estimate;
-  estimate.featureDim = tileMixHandoffFeatureDim(params, model);
-  estimate.dtypeBytes = params.dtypeBytes;
+  estimate.featureDim = features.handoffFeatureDim;
+  estimate.dtypeBytes = features.dtypeBytes;
+  estimate.tileBytes = features.handoffTileBytes;
+  estimate.intermediateTileBytes = features.intermediateTileBytes;
   int64_t localBytes = minPositiveLocalBytes(l0cBytes, ubBytes);
   estimate.targetBytes =
       scaledLocalTargetBytes(localBytes, model.handoffTargetFraction);
   estimate.intermediateTargetBytes =
       scaledLocalTargetBytes(ubBytes, model.intermediateTargetFraction);
-  if (estimate.featureDim <= 0 || estimate.dtypeBytes <= 0 ||
-      params.blockN <= 0 || baseCycles <= 0 ||
-      model.handoffMaxReliefRatio <= 0.0)
-    return estimate;
-
-  int64_t bytesPerBlockN = estimate.featureDim * estimate.dtypeBytes;
-  if (bytesPerBlockN <= 0)
-    return estimate;
-  estimate.tileBytes = bytesPerBlockN * params.blockN;
-  estimate.neutralBlockN =
-      std::max<int64_t>(1, estimate.targetBytes / bytesPerBlockN);
+  if (estimate.featureDim > 0 && estimate.dtypeBytes > 0) {
+    int64_t bytesPerBlockN = estimate.featureDim * estimate.dtypeBytes;
+    if (bytesPerBlockN > 0)
+      estimate.neutralBlockN =
+          std::max<int64_t>(1, estimate.targetBytes / bytesPerBlockN);
+  }
   int64_t intermediateDtypeBytes = static_cast<int64_t>(
       std::llround(model.intermediateDtypeBytes > 0.0
                        ? model.intermediateDtypeBytes
                        : static_cast<double>(estimate.dtypeBytes)));
-  if (params.blockM > 0 && intermediateDtypeBytes > 0) {
-    int64_t bytesPerBlockM = params.blockN * intermediateDtypeBytes;
-    estimate.intermediateTileBytes = params.blockM * bytesPerBlockM;
+  if (features.tileN > 0 && intermediateDtypeBytes > 0) {
+    int64_t bytesPerBlockM = features.tileN * intermediateDtypeBytes;
     if (bytesPerBlockM > 0)
       estimate.neutralBlockM = std::max<int64_t>(
           1, estimate.intermediateTargetBytes / bytesPerBlockM);
   }
+  if (estimate.tileBytes <= 0 || baseCycles <= 0 ||
+      model.handoffMaxReliefRatio <= 0.0)
+    return estimate;
   if (estimate.tileBytes <= estimate.targetBytes)
     return estimate;
 
@@ -491,23 +614,25 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
   }
 
   auto computeSegments = [&](int64_t pathCycles, int64_t loopTrip,
-                             int64_t layoutOpCount, int64_t tileMixLoop) {
-    (void)layoutOpCount;
+                             int64_t tileMixLoop) {
     if (pathCycles <= 0)
       return int64_t(0);
     if (tileMixLoop <= 1)
       return int64_t(1);
+
+    // TileCubeVectorLoop uses tile_mix_*_loop as the target loop trip count
+    // after splitting.  A larger value means finer CopyOut/producer tiling; 1
+    // means no extra tiling.  The previous model interpreted the option in the
+    // opposite direction, which made coarse tiling look artificially better.
     if (loopTrip > 0)
       return std::max<int64_t>(1, std::min<int64_t>(tileMixLoop, loopTrip));
     return std::max<int64_t>(1, tileMixLoop);
   };
 
   stats.cubeSegmentCount = computeSegments(
-      cubePathCycles, stats.cubeLoopTrip, stats.cubeLayoutOpCount,
-      params.cubeLoop);
+      cubePathCycles, stats.cubeLoopTrip, params.cubeLoop);
   stats.vectorSegmentCount = computeSegments(
-      vectorPathCycles, stats.vectorLoopTrip, stats.vectorLayoutOpCount,
-      params.vectorLoop);
+      vectorPathCycles, stats.vectorLoopTrip, params.vectorLoop);
 
   int64_t l0cBytes = static_cast<int64_t>(config.getMemorySizeBytes("l0c"));
   int64_t ubBytes = static_cast<int64_t>(config.getMemorySizeBytes("ub"));
@@ -516,12 +641,19 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
   if (ubBytes <= 0)
     ubBytes = 256 * 1024;
   TileMixModelConfig model = getTileMixModelConfig(config);
+  TileMixDerivedFeatures features = inferTileMixDerivedFeatures(scheduler);
 
   int64_t rawCubeWorkspaceBytes =
       std::max<int64_t>(stats.cubeWorkspaceBytes, 1);
   int64_t rawVectorWorkspaceBytes =
       std::max<int64_t>(stats.vectorWorkspaceBytes, 1);
 
+  // The pass works by slicing CopyOut and its producers so that each sub-tile
+  // fits the local buffer regime.  L0C/UB cannot be treated as fully available
+  // to one value: CV pipelining, alignment, and co-live producer temporaries
+  // all consume part of it.  The available fraction is a chip-level cost-model
+  // parameter, so different Ascend generations can tune it without changing
+  // the formula.
   stats.cubeTargetBytes =
       scaledLocalTargetBytes(l0cBytes, model.bufferTargetFraction);
   stats.vectorTargetBytes =
@@ -531,6 +663,15 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
   stats.vectorSubtileBytes =
       ceilDiv(rawVectorWorkspaceBytes, std::max<int64_t>(stats.vectorSegmentCount, 1));
 
+  // TileCubeVectorLoop is meant to reduce local-buffer/workspace pressure by
+  // slicing CopyOut and its producers.  Model that as a before/after pressure
+  // delta instead of an always-positive penalty: only bytes above the effective
+  // local-buffer target create pressure, and finer tilemix can reduce it.
+  //
+  // The adjustment is bounded by transfer-side work and amortized by one
+  // vector alignment quantum.  This keeps compile-parameter effects local: they
+  // can break ties within a tiling family, but they should not overwhelm the
+  // primary roofline signal when TTIR cannot prove a real spill.
   int64_t pressureGranularity = scaledLocalTargetBytes(
       config.getVectorWidthBytes(), model.pressureGranularityFraction);
   int64_t cubeBeforePressure = overflowPressureCycles(
@@ -554,7 +695,7 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
   int64_t pressureAdjustedCycles =
       std::max<int64_t>(baseCycles, std::max(adjustedCubePath, adjustedVectorPath));
   TileMixHandoffEstimate handoff = estimateTileMixHandoffRelief(
-      baseCycles, params, model, l0cBytes, ubBytes);
+      baseCycles, features, model, l0cBytes, ubBytes);
   int64_t intermediatePressurePenalty =
       tileMixIntermediatePressurePenaltyCycles(baseCycles, handoff, model);
   int64_t loopGranularityRelief = tileMixLoopGranularityReliefCycles(
@@ -576,6 +717,8 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
 
   stats.boundaryCycles = 0;
   stats.balancePenaltyCycles = 0;
+  stats.inferredTileM = features.tileM;
+  stats.inferredTileN = features.tileN;
   stats.handoffReliefCycles = handoff.reliefCycles;
   stats.handoffFeatureDim = handoff.featureDim;
   stats.handoffDtypeBytes = handoff.dtypeBytes;
@@ -589,6 +732,10 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
   stats.loopGranularityReliefCycles = loopGranularityRelief;
   stats.loopMismatchPenaltyCycles = loopMismatchPenalty;
   stats.syncFrequencyPenaltyCycles = segmentSyncPenalty;
+  stats.tileShapeSource = features.tileShapeSource;
+  stats.dtypeSource = features.dtypeSource;
+  stats.handoffSource = features.handoffSource;
+  stats.intermediateSource = features.intermediateSource;
   stats.workspaceReliefCycles =
       std::max<int64_t>(0, cubeBeforePressure - cubeAfterPressure) +
       std::max<int64_t>(0, vectorBeforePressure - vectorAfterPressure);
@@ -833,7 +980,6 @@ struct PipelineAnalysisPass
       return signalPassFailure();
     }
     const HardwareConfig &config = *hardwareConfig;
-    TileMixParams tileMixParams = parseTileMixParams(compileParamsStr);
 
     // Parse bindings
     llvm::DenseMap<unsigned, int64_t> argBindings;
@@ -855,6 +1001,8 @@ struct PipelineAnalysisPass
         return signalPassFailure();
       }
     }
+
+    TileMixParams tileMixParams = parseTileMixParams(compileParamsStr);
     
     // Collect loops and ensure trip counts are set
     SmallVector<scf::ForOp> allLoops;
@@ -964,11 +1112,17 @@ struct PipelineAnalysisPass
       vecTransfer = std::max(hwUnitCycles[HWUnit::VecMTE2], hwUnitCycles[HWUnit::MTE3]);
     int64_t vectorPathCycles = std::max(hwUnitCycles[HWUnit::Vector], vecTransfer);
 
-    // Total before TTIR tilemix modeling: max of paths (Cube and Vector paths overlap)
+    // Total: max of paths (Cube and Vector paths overlap). If tile mix
+    // parameters are present, refine this optimistic roofline with a TTIR-only
+    // approximation of the TileCubeVectorLoop implementation: loop tiling
+    // changes C/V handoff granularity and workspace/layout pressure, but the
+    // model never assumes HIVM-only CopyOut/subview details are directly
+    // visible in TTIR.
     int64_t baseRooflineTotalCycles = std::max(cubePathCycles, vectorPathCycles);
     int64_t cubeTransferCycles =
         hwUnitCycles[HWUnit::CubeMTE2] + hwUnitCycles[HWUnit::FixPipe];
-    int64_t vectorTransferCycles = vecTransfer;
+    int64_t vectorTransferCycles =
+        hwUnitCycles[HWUnit::VecMTE2] + hwUnitCycles[HWUnit::MTE3];
     TileMixBalanceStats tileMixStats = estimateTileMixLoopTilingBalance(
         tileMixParams, scheduler, config, cubePathCycles, vectorPathCycles,
         cubeTransferCycles, vectorTransferCycles, baseRooflineTotalCycles);
@@ -983,103 +1137,110 @@ struct PipelineAnalysisPass
     
     module->setAttr("ascend.scheduled_cycles_one_iter",
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), oneIterCycles));
-    module->setAttr("ascend.base_roofline_cycles",
-                    IntegerAttr::get(IntegerType::get(module.getContext(), 64),
-                                     baseRooflineTotalCycles));
     module->setAttr("ascend.roofline_cycles",
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), rooflineTotalCycles));
-    // Public summary consumed by the PerfReport pass (and any in-process
-    // costmodel bridge). This must include loop multipliers; otherwise configs
-    // with many inner-loop iterations are under-estimated and can incorrectly
-    // outrank faster configs during costmodel prefiltering (root cause 4).
+    module->setAttr("ascend.base_roofline_cycles",
+                    IntegerAttr::get(IntegerType::get(module.getContext(), 64), baseRooflineTotalCycles));
+    if (tileMixStats.used) {
+      module->setAttr("ascend.tile_mix_schedule_model",
+                      StringAttr::get(module.getContext(), "ttir_tilemix_working_set_loop"));
+      module->setAttr("ascend.tile_mix_model_valid",
+                      BoolAttr::get(module.getContext(), tileMixStats.valid));
+      module->setAttr("ascend.tile_mix_adjusted_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.adjustedCycles));
+      module->setAttr("ascend.tile_mix_net_delta_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.netDeltaCycles));
+      module->setAttr("ascend.tile_mix_boundary_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.boundaryCycles));
+      module->setAttr("ascend.tile_mix_balance_penalty_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.balancePenaltyCycles));
+      module->setAttr("ascend.tile_mix_handoff_relief_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.handoffReliefCycles));
+      module->setAttr("ascend.tile_mix_workspace_relief_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.workspaceReliefCycles));
+      module->setAttr("ascend.tile_mix_buffer_fit_penalty_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.bufferFitPenaltyCycles));
+      module->setAttr("ascend.tile_mix_sync_frequency_penalty_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.syncFrequencyPenaltyCycles));
+      module->setAttr("ascend.tile_mix_cube_segments",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.cubeSegmentCount));
+      module->setAttr("ascend.tile_mix_vector_segments",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.vectorSegmentCount));
+      module->setAttr("ascend.tile_mix_cube_loop_trip",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.cubeLoopTrip));
+      module->setAttr("ascend.tile_mix_vector_loop_trip",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.vectorLoopTrip));
+      module->setAttr("ascend.tile_mix_cube_layout_ops",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.cubeLayoutOpCount));
+      module->setAttr("ascend.tile_mix_vector_layout_ops",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.vectorLayoutOpCount));
+      module->setAttr("ascend.tile_mix_cube_workspace_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.cubeWorkspaceBytes));
+      module->setAttr("ascend.tile_mix_vector_workspace_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.vectorWorkspaceBytes));
+      module->setAttr("ascend.tile_mix_cube_subtile_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.cubeSubtileBytes));
+      module->setAttr("ascend.tile_mix_vector_subtile_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.vectorSubtileBytes));
+      module->setAttr("ascend.tile_mix_cube_target_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.cubeTargetBytes));
+      module->setAttr("ascend.tile_mix_vector_target_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.vectorTargetBytes));
+      if (tileMixStats.inferredTileM > 0) {
+        module->setAttr("ascend.tile_mix_block_m",
+                        IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.inferredTileM));
+        module->setAttr("ascend.tile_mix_inferred_block_m",
+                        IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.inferredTileM));
+      }
+      if (tileMixStats.inferredTileN > 0) {
+        module->setAttr("ascend.tile_mix_block_n",
+                        IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.inferredTileN));
+        module->setAttr("ascend.tile_mix_inferred_block_n",
+                        IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.inferredTileN));
+      }
+      module->setAttr("ascend.tile_mix_tile_shape_source",
+                      StringAttr::get(module.getContext(), tileMixStats.tileShapeSource));
+      module->setAttr("ascend.tile_mix_dtype_source",
+                      StringAttr::get(module.getContext(), tileMixStats.dtypeSource));
+      module->setAttr("ascend.tile_mix_handoff_source",
+                      StringAttr::get(module.getContext(), tileMixStats.handoffSource));
+      module->setAttr("ascend.tile_mix_intermediate_source",
+                      StringAttr::get(module.getContext(), tileMixStats.intermediateSource));
+      module->setAttr("ascend.tile_mix_handoff_feature_dim",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.handoffFeatureDim));
+      module->setAttr("ascend.tile_mix_handoff_dtype_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.handoffDtypeBytes));
+      module->setAttr("ascend.tile_mix_handoff_tile_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.handoffTileBytes));
+      module->setAttr("ascend.tile_mix_handoff_target_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.handoffTargetBytes));
+      module->setAttr("ascend.tile_mix_handoff_neutral_block_n",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.handoffNeutralBlockN));
+      module->setAttr("ascend.tile_mix_intermediate_tile_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.intermediateTileBytes));
+      module->setAttr("ascend.tile_mix_intermediate_target_bytes",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.intermediateTargetBytes));
+      module->setAttr("ascend.tile_mix_intermediate_neutral_block_m",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.intermediateNeutralBlockM));
+      module->setAttr("ascend.tile_mix_intermediate_pressure_penalty_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.intermediatePressurePenaltyCycles));
+      module->setAttr("ascend.tile_mix_loop_granularity_relief_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.loopGranularityReliefCycles));
+      module->setAttr("ascend.tile_mix_loop_mismatch_penalty_cycles",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.loopMismatchPenaltyCycles));
+    }
+    if (tileMixParams.vectorLoop > 0) {
+      module->setAttr("ascend.tile_mix_vector_loop",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixParams.vectorLoop));
+    }
+    if (tileMixParams.cubeLoop > 0) {
+      module->setAttr("ascend.tile_mix_cube_loop",
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixParams.cubeLoop));
+    }
     module->setAttr("ascend.scheduled_cycles",
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), rooflineTotalCycles));
     module->setAttr("ascend.simple_sum_cycles",
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), simpleSumCycles));
-    auto setI64Attr = [&](llvm::StringRef name, int64_t value) {
-      module->setAttr(name, IntegerAttr::get(
-                                IntegerType::get(module.getContext(), 64),
-                                value));
-    };
-    auto setBoolAttr = [&](llvm::StringRef name, bool value) {
-      module->setAttr(name, BoolAttr::get(module.getContext(), value));
-    };
-    if (tileMixParams.blockM > 0)
-      setI64Attr("ascend.tile_mix_block_m", tileMixParams.blockM);
-    if (tileMixParams.blockN > 0)
-      setI64Attr("ascend.tile_mix_block_n", tileMixParams.blockN);
-    if (tileMixParams.cubeLoop > 0)
-      setI64Attr("ascend.tile_mix_cube_loop", tileMixParams.cubeLoop);
-    if (tileMixParams.vectorLoop > 0)
-      setI64Attr("ascend.tile_mix_vector_loop", tileMixParams.vectorLoop);
-    if (tileMixStats.used) {
-      module->setAttr("ascend.tile_mix_schedule_model",
-                      StringAttr::get(module.getContext(),
-                                      "ttir_tilemix_working_set_loop"));
-      setBoolAttr("ascend.tile_mix_model_valid", tileMixStats.valid);
-      setI64Attr("ascend.tile_mix_adjusted_cycles",
-                 tileMixStats.adjustedCycles);
-      setI64Attr("ascend.tile_mix_net_delta_cycles",
-                 tileMixStats.netDeltaCycles);
-      setI64Attr("ascend.tile_mix_boundary_cycles",
-                 tileMixStats.boundaryCycles);
-      setI64Attr("ascend.tile_mix_balance_penalty_cycles",
-                 tileMixStats.balancePenaltyCycles);
-      setI64Attr("ascend.tile_mix_handoff_relief_cycles",
-                 tileMixStats.handoffReliefCycles);
-      setI64Attr("ascend.tile_mix_workspace_relief_cycles",
-                 tileMixStats.workspaceReliefCycles);
-      setI64Attr("ascend.tile_mix_buffer_fit_penalty_cycles",
-                 tileMixStats.bufferFitPenaltyCycles);
-      setI64Attr("ascend.tile_mix_sync_frequency_penalty_cycles",
-                 tileMixStats.syncFrequencyPenaltyCycles);
-      setI64Attr("ascend.tile_mix_intermediate_pressure_penalty_cycles",
-                 tileMixStats.intermediatePressurePenaltyCycles);
-      setI64Attr("ascend.tile_mix_loop_granularity_relief_cycles",
-                 tileMixStats.loopGranularityReliefCycles);
-      setI64Attr("ascend.tile_mix_loop_mismatch_penalty_cycles",
-                 tileMixStats.loopMismatchPenaltyCycles);
-      setI64Attr("ascend.tile_mix_cube_segments",
-                 tileMixStats.cubeSegmentCount);
-      setI64Attr("ascend.tile_mix_vector_segments",
-                 tileMixStats.vectorSegmentCount);
-      setI64Attr("ascend.tile_mix_cube_loop_trip",
-                 tileMixStats.cubeLoopTrip);
-      setI64Attr("ascend.tile_mix_vector_loop_trip",
-                 tileMixStats.vectorLoopTrip);
-      setI64Attr("ascend.tile_mix_cube_layout_ops",
-                 tileMixStats.cubeLayoutOpCount);
-      setI64Attr("ascend.tile_mix_vector_layout_ops",
-                 tileMixStats.vectorLayoutOpCount);
-      setI64Attr("ascend.tile_mix_cube_workspace_bytes",
-                 tileMixStats.cubeWorkspaceBytes);
-      setI64Attr("ascend.tile_mix_vector_workspace_bytes",
-                 tileMixStats.vectorWorkspaceBytes);
-      setI64Attr("ascend.tile_mix_cube_subtile_bytes",
-                 tileMixStats.cubeSubtileBytes);
-      setI64Attr("ascend.tile_mix_vector_subtile_bytes",
-                 tileMixStats.vectorSubtileBytes);
-      setI64Attr("ascend.tile_mix_cube_target_bytes",
-                 tileMixStats.cubeTargetBytes);
-      setI64Attr("ascend.tile_mix_vector_target_bytes",
-                 tileMixStats.vectorTargetBytes);
-      setI64Attr("ascend.tile_mix_handoff_feature_dim",
-                 tileMixStats.handoffFeatureDim);
-      setI64Attr("ascend.tile_mix_handoff_dtype_bytes",
-                 tileMixStats.handoffDtypeBytes);
-      setI64Attr("ascend.tile_mix_handoff_tile_bytes",
-                 tileMixStats.handoffTileBytes);
-      setI64Attr("ascend.tile_mix_handoff_target_bytes",
-                 tileMixStats.handoffTargetBytes);
-      setI64Attr("ascend.tile_mix_handoff_neutral_block_n",
-                 tileMixStats.handoffNeutralBlockN);
-      setI64Attr("ascend.tile_mix_intermediate_tile_bytes",
-                 tileMixStats.intermediateTileBytes);
-      setI64Attr("ascend.tile_mix_intermediate_target_bytes",
-                 tileMixStats.intermediateTargetBytes);
-      setI64Attr("ascend.tile_mix_intermediate_neutral_block_m",
-                 tileMixStats.intermediateNeutralBlockM);
-    }
     
     // Print results
     llvm::outs() << "\n=== Pipeline Analysis (" << config.getName() << ") ===\n";
@@ -1098,36 +1259,82 @@ struct PipelineAnalysisPass
     llvm::outs() << "\nTotal cycles:\n";
     llvm::outs() << "  Simple sum (no overlap): " << simpleSumCycles 
                  << " (" << llvm::format("%.3f", config.cyclesToMicroseconds(simpleSumCycles)) << " us)\n";
-    llvm::outs() << "  Roofline model (with overlap): " << rooflineTotalCycles 
-                 << " (" << llvm::format("%.3f", config.cyclesToMicroseconds(rooflineTotalCycles)) << " us)\n";
+    llvm::outs() << "  Roofline base (with overlap): " << baseRooflineTotalCycles
+                 << " (" << llvm::format("%.3f", config.cyclesToMicroseconds(baseRooflineTotalCycles)) << " us)\n";
     if (tileMixStats.used) {
-      llvm::outs() << "  Base roofline before tilemix: " << baseRooflineTotalCycles
-                   << " (" << llvm::format("%.3f",
-                                           config.cyclesToMicroseconds(
-                                               baseRooflineTotalCycles))
-                   << " us)\n";
-      llvm::outs() << "  Tilemix delta: " << tileMixStats.netDeltaCycles
-                   << " cycles, handoff relief "
-                   << tileMixStats.handoffReliefCycles
-                   << ", workspace relief "
-                   << tileMixStats.workspaceReliefCycles
-                   << ", buffer-fit penalty "
-                   << tileMixStats.bufferFitPenaltyCycles
-                   << ", sync penalty "
-                   << tileMixStats.syncFrequencyPenaltyCycles
-                   << ", intermediate pressure "
-                   << tileMixStats.intermediatePressurePenaltyCycles
-                   << ", loop granularity relief "
-                   << tileMixStats.loopGranularityReliefCycles
-                   << ", loop mismatch penalty "
-                   << tileMixStats.loopMismatchPenaltyCycles << "\n";
-      llvm::outs() << "  Tilemix segments: cube "
-                   << tileMixStats.cubeSegmentCount << ", vector "
-                   << tileMixStats.vectorSegmentCount << "; params BM="
-                   << tileMixParams.blockM << ", BN=" << tileMixParams.blockN
+      llvm::outs() << "  Tile mix params: vector_loop=" << tileMixParams.vectorLoop
                    << ", cube_loop=" << tileMixParams.cubeLoop
-                   << ", vector_loop=" << tileMixParams.vectorLoop << "\n";
+                   << "\n";
+      llvm::outs() << "  Tile mix inferred features: block_m="
+                   << tileMixStats.inferredTileM
+                   << ", block_n=" << tileMixStats.inferredTileN
+                   << ", tile_shape_source="
+                   << tileMixStats.tileShapeSource
+                   << ", dtype_source=" << tileMixStats.dtypeSource
+                   << ", handoff_source=" << tileMixStats.handoffSource
+                   << ", intermediate_source="
+                   << tileMixStats.intermediateSource << "\n";
+      llvm::outs() << "  Tile mix TTIR buffer fit: "
+                   << (tileMixStats.valid ? "valid" : "fallback")
+                   << ", cube_segments=" << tileMixStats.cubeSegmentCount
+                   << ", vector_segments=" << tileMixStats.vectorSegmentCount
+                   << ", cube_loop_trip=" << tileMixStats.cubeLoopTrip
+                   << ", vector_loop_trip=" << tileMixStats.vectorLoopTrip
+                   << "\n";
+      llvm::outs() << "  Tile mix layout proxies: cube_layout_ops="
+                   << tileMixStats.cubeLayoutOpCount
+                   << ", vector_layout_ops="
+                   << tileMixStats.vectorLayoutOpCount << "\n";
+      llvm::outs() << "  Tile mix buffer fit: cube_workspace_bytes="
+                   << tileMixStats.cubeWorkspaceBytes
+                   << ", vector_workspace_bytes="
+                   << tileMixStats.vectorWorkspaceBytes
+                   << ", cube_subtile_bytes="
+                   << tileMixStats.cubeSubtileBytes
+                   << ", vector_subtile_bytes="
+                   << tileMixStats.vectorSubtileBytes
+                   << ", cube_target_bytes="
+                   << tileMixStats.cubeTargetBytes
+                   << ", vector_target_bytes="
+                   << tileMixStats.vectorTargetBytes << "\n";
+      llvm::outs() << "  Tile mix handoff footprint: feature_dim="
+                   << tileMixStats.handoffFeatureDim
+                   << ", dtype_bytes="
+                   << tileMixStats.handoffDtypeBytes
+                   << ", tile_bytes="
+                   << tileMixStats.handoffTileBytes
+                   << ", target_bytes="
+                   << tileMixStats.handoffTargetBytes
+                   << ", neutral_block_n="
+                   << tileMixStats.handoffNeutralBlockN << "\n";
+      llvm::outs() << "  Tile mix intermediate footprint: tile_bytes="
+                   << tileMixStats.intermediateTileBytes
+                   << ", target_bytes="
+                   << tileMixStats.intermediateTargetBytes
+                   << ", neutral_block_m="
+                   << tileMixStats.intermediateNeutralBlockM << "\n";
+      llvm::outs() << "  Tile mix delta cycles: boundary="
+                   << tileMixStats.boundaryCycles
+                   << ", balance_penalty="
+                   << tileMixStats.balancePenaltyCycles
+                   << ", handoff_relief="
+                   << tileMixStats.handoffReliefCycles
+                   << ", loop_granularity_relief="
+                   << tileMixStats.loopGranularityReliefCycles
+                   << ", workspace_relief="
+                   << tileMixStats.workspaceReliefCycles
+                   << ", buffer_fit_penalty="
+                   << tileMixStats.bufferFitPenaltyCycles
+                   << ", intermediate_pressure_penalty="
+                   << tileMixStats.intermediatePressurePenaltyCycles
+                   << ", loop_mismatch_penalty="
+                   << tileMixStats.loopMismatchPenaltyCycles
+                    << ", sync_frequency_penalty="
+                    << tileMixStats.syncFrequencyPenaltyCycles
+                    << ", net_delta=" << tileMixStats.netDeltaCycles << "\n";
     }
+    llvm::outs() << "  Roofline model (TTIR buffer-fit tile mix): " << rooflineTotalCycles
+                 << " (" << llvm::format("%.3f", config.cyclesToMicroseconds(rooflineTotalCycles)) << " us)\n";
     llvm::outs() << "  Speedup from overlap: " << llvm::format("%.2fx", 
                     static_cast<double>(simpleSumCycles) / std::max(rooflineTotalCycles, 1L)) << "\n";
     

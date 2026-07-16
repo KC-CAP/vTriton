@@ -274,7 +274,6 @@
                                                   "tilemix_handoff_local_target_fraction":  0.125,
                                                   "tilemix_handoff_max_relief_ratio":  0.25,
                                                   "tilemix_handoff_max_log2_steps":  1.0,
-                                                  "tilemix_handoff_tensor_count":  2.0,
                                                   "tilemix_intermediate_ub_target_fraction":  0.125,
                                                   "tilemix_intermediate_dtype_bytes":  4.0,
                                                   "tilemix_intermediate_pressure_penalty_ratio":  0.18,
