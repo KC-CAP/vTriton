@@ -269,21 +269,7 @@
                         "vec_cycle_csv":  "perfbound/calibration/data/vec_cycle_910b3_v3.csv",
                         "notes":  "Scalar basic ALU cycles tightened to 3.0843 from remote scalar_peak.cce; vector/cube/MTE inherited from v3; AGU/misc remain estimated; sync costs consumed through model-side sync fallback.",
                         "cost_model_params":  {
-                                                  "tilemix_buffer_target_fraction":  0.125,
-                                                  "tilemix_pressure_granularity_fraction":  0.125,
-                                                  "tilemix_handoff_local_target_fraction":  0.125,
-                                                  "tilemix_handoff_max_relief_ratio":  0.25,
-                                                  "tilemix_handoff_max_log2_steps":  1.0,
-                                                  "tilemix_intermediate_ub_target_fraction":  0.125,
-                                                  "tilemix_intermediate_dtype_bytes":  4.0,
-                                                  "tilemix_intermediate_pressure_penalty_ratio":  0.18,
-                                                  "tilemix_intermediate_pressure_max_log2_steps":  1.0,
-                                                  "tilemix_loop_granularity_relief_ratio":  0.02,
-                                                  "tilemix_loop_granularity_max_log2_steps":  2.0,
-                                                  "tilemix_loop_mismatch_penalty_ratio":  0.01,
-                                                  "tilemix_sync_frequency_penalty_ratio":  0.01,
-                                                  "tilemix_sync_neutral_segments":  4.0,
-                                                  "tilemix_sync_penalty_segments":  8.0
+                                                  "tilemix_loop_control_cycles_per_segment":  2.0
                                               },
                         "startup_latencies":  {
                                                   "vector_startup_cycles":  35,

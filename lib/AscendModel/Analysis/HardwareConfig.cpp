@@ -128,21 +128,9 @@ mlir::ascend::loadHardwareConfigForAnalysis(llvm::StringRef path,
 HardwareConfig::HardwareConfig() : clockFreqGHz(1.0) {
   // Fallbacks for legacy configs. Production calibration should override these
   // through calibration.cost_model_params in the hardware JSON.
-  costModelParams["tilemix_buffer_target_fraction"] = 0.125;
-  costModelParams["tilemix_pressure_granularity_fraction"] = 0.125;
-  costModelParams["tilemix_handoff_local_target_fraction"] = 0.125;
-  costModelParams["tilemix_handoff_max_relief_ratio"] = 0.25;
-  costModelParams["tilemix_handoff_max_log2_steps"] = 1.0;
-  costModelParams["tilemix_intermediate_ub_target_fraction"] = 0.125;
-  costModelParams["tilemix_intermediate_dtype_bytes"] = 4.0;
-  costModelParams["tilemix_intermediate_pressure_penalty_ratio"] = 0.0;
-  costModelParams["tilemix_intermediate_pressure_max_log2_steps"] = 1.0;
-  costModelParams["tilemix_loop_granularity_relief_ratio"] = 0.0;
-  costModelParams["tilemix_loop_granularity_max_log2_steps"] = 2.0;
-  costModelParams["tilemix_loop_mismatch_penalty_ratio"] = 0.0;
-  costModelParams["tilemix_sync_frequency_penalty_ratio"] = 0.01;
-  costModelParams["tilemix_sync_neutral_segments"] = 4.0;
-  costModelParams["tilemix_sync_penalty_segments"] = 8.0;
+  // TileMix v1 uses only physical marginal terms. The two cycles below model
+  // one loop compare/update pair for every additional generated segment.
+  costModelParams["tilemix_loop_control_cycles_per_segment"] = 2.0;
 }
 
 HardwareConfig::~HardwareConfig() = default;
