@@ -49,8 +49,6 @@ struct TileMixParams {
   bool hasAny = false;
   int64_t vectorLoop = 0;
   int64_t cubeLoop = 0;
-  int64_t workspaceMultibuffer = 1;
-  bool workspaceMultibufferPresent = false;
   bool summaryPresent = false;
   bool summaryValid = false;
   bool vectorApplied = false;
@@ -62,6 +60,11 @@ struct TileMixParams {
   std::string summarySource = "missing";
   std::string vectorSkipReason = "missing_pass_summary";
   std::string cubeSkipReason = "missing_pass_summary";
+};
+
+struct WorkspaceMultibufferParams {
+  bool present = false;
+  int64_t requestedSlots = 1;
 };
 
 struct TileMixModelConfig {
@@ -81,7 +84,7 @@ struct TileMixDerivedFeatures {
   std::string intermediateSource = "none";
 };
 
-struct TileMixBalanceStats {
+struct TileMixStats {
   bool used = false;
   bool valid = false;
   bool adjustmentApplied = false;
@@ -129,28 +132,6 @@ struct TileMixBalanceStats {
   int64_t bufferDeltaCycles = 0;
   int64_t pipelineDeltaCycles = 0;
   int64_t scalarControlDeltaCycles = 0;
-  int64_t workspaceMultibuffer = 1;
-  int64_t multibufferReferenceSlots = 1;
-  int64_t multibufferSlotDelta = 0;
-  int64_t multibufferExtraSlots = 0;
-  int64_t multibufferWorkspaceCount = 0;
-  int64_t multibufferCubeToVectorFamilyCount = 0;
-  int64_t multibufferVectorToCubeFamilyCount = 0;
-  int64_t multibufferWorkspaceBytesPerSlot = 0;
-  int64_t multibufferIterationCount = 0;
-  int64_t multibufferCubeToVectorIterations = 0;
-  int64_t multibufferVectorToCubeIterations = 0;
-  int64_t multibufferCubeProducerTailCycles = 0;
-  int64_t multibufferVectorProducerTailCycles = 0;
-  int64_t multibufferSyncPairCycles = 0;
-  int64_t multibufferSyncDeltaCycles = 0;
-  int64_t multibufferBlockingCycles = 0;
-  int64_t multibufferReferenceBlockingCycles = 0;
-  int64_t multibufferProducerWaitReliefCycles = 0;
-  int64_t multibufferReferenceQueuePenaltyCycles = 0;
-  int64_t multibufferOverlapReliefCycles = 0;
-  int64_t multibufferQueueDeltaCycles = 0;
-  int64_t multibufferNetDeltaCycles = 0;
   int64_t syncOpsBefore = 0;
   int64_t syncOpsAfter = 0;
   std::string summarySource = "missing";
@@ -160,6 +141,34 @@ struct TileMixBalanceStats {
   std::string dtypeSource = "none";
   std::string handoffSource = "none";
   std::string intermediateSource = "none";
+};
+
+struct WorkspaceMultibufferStats {
+  bool used = false;
+  bool valid = false;
+  bool adjustmentApplied = false;
+  int64_t requestedSlots = 1;
+  int64_t referenceSlots = 1;
+  int64_t slotDelta = 0;
+  int64_t extraSlots = 0;
+  int64_t workspaceFamilyCount = 0;
+  int64_t cubeToVectorFamilyCount = 0;
+  int64_t vectorToCubeFamilyCount = 0;
+  int64_t workspaceBytesPerSlot = 0;
+  int64_t iterationCount = 0;
+  int64_t cubeToVectorIterations = 0;
+  int64_t vectorToCubeIterations = 0;
+  int64_t cubeProducerTailCycles = 0;
+  int64_t vectorProducerTailCycles = 0;
+  int64_t syncPairCycles = 0;
+  int64_t syncDeltaCycles = 0;
+  int64_t blockingCycles = 0;
+  int64_t referenceBlockingCycles = 0;
+  int64_t producerWaitReliefCycles = 0;
+  int64_t referenceQueuePenaltyCycles = 0;
+  int64_t overlapReliefCycles = 0;
+  int64_t queueDeltaCycles = 0;
+  int64_t netDeltaCycles = 0;
 };
 
 enum class TileMixPath { None = 0, Cube = 1, Vector = 2 };
@@ -212,11 +221,6 @@ TileMixParams parseTileMixParams(llvm::StringRef compileParamsStr) {
     } else if (key == "tile_mix_cube_loop" && parsePositiveInt(value, parsed)) {
       params.cubeLoop = parsed;
       params.hasAny = true;
-    } else if (key == "set_workspace_multibuffer" &&
-               parsePositiveInt(value, parsed)) {
-      params.workspaceMultibuffer = parsed;
-      params.workspaceMultibufferPresent = true;
-      params.hasAny = true;
     } else if (key == "tile_mix_summary_source" && !value.empty()) {
       params.summarySource = value.str();
       params.summaryPresent = true;
@@ -248,10 +252,45 @@ TileMixParams parseTileMixParams(llvm::StringRef compileParamsStr) {
   return params;
 }
 
+WorkspaceMultibufferParams
+parseWorkspaceMultibufferParams(llvm::StringRef compileParamsStr) {
+  WorkspaceMultibufferParams params;
+  llvm::SmallVector<llvm::StringRef, 8> items;
+  compileParamsStr.split(items, ',', -1, false);
+  for (llvm::StringRef item : items) {
+    item = item.trim();
+    if (item.empty())
+      continue;
+    std::pair<llvm::StringRef, llvm::StringRef> kv = item.split('=');
+    llvm::StringRef key = kv.first.trim();
+    llvm::StringRef value = kv.second.trim();
+    int64_t parsed = 0;
+    if (key == "set_workspace_multibuffer" &&
+        parsePositiveInt(value, parsed)) {
+      params.requestedSlots = parsed;
+      params.present = true;
+    }
+  }
+  return params;
+}
+
 bool isTileMixDagModelEnabled() {
   const char *mode = std::getenv("ASCEND_COSTMODEL_TILE_MIX_MODEL");
   if (!mode)
     return true;
+  llvm::StringRef value(mode);
+  return !(value.equals_insensitive("0") || value.equals_insensitive("off") ||
+           value.equals_insensitive("false") || value.equals_insensitive("none"));
+}
+
+bool isWorkspaceMultibufferModelEnabled() {
+  const char *mode =
+      std::getenv("ASCEND_COSTMODEL_WORKSPACE_MULTIBUFFER_MODEL");
+  // Preserve existing Off/On report behavior when the new independent switch
+  // is not set. Callers can explicitly control the peer feature with the new
+  // variable.
+  if (!mode)
+    return isTileMixDagModelEnabled();
   llvm::StringRef value(mode);
   return !(value.equals_insensitive("0") || value.equals_insensitive("off") ||
            value.equals_insensitive("false") || value.equals_insensitive("none"));
@@ -692,12 +731,90 @@ BoundedBufferSchedule scheduleFiniteWorkspaceBuffer(
   return result;
 }
 
-TileMixBalanceStats estimateTileMixLoopTilingBalance(
+WorkspaceMultibufferStats estimateWorkspaceMultibuffer(
+    const WorkspaceMultibufferParams &params,
+    const PipelineScheduler &scheduler, const HardwareConfig &config,
+    int64_t cubePathCycles, int64_t vectorPathCycles) {
+  WorkspaceMultibufferStats stats;
+  if (!params.present || !isWorkspaceMultibufferModelEnabled())
+    return stats;
+
+  stats.used = true;
+  stats.requestedSlots = std::max<int64_t>(1, params.requestedSlots);
+  WorkspaceMultibufferEvidence evidence =
+      inferWorkspaceMultibufferEvidence(scheduler);
+  stats.workspaceFamilyCount = evidence.familyCount;
+  stats.cubeToVectorFamilyCount = evidence.cubeToVectorFamilyCount;
+  stats.vectorToCubeFamilyCount = evidence.vectorToCubeFamilyCount;
+  stats.workspaceBytesPerSlot = evidence.bytesPerSlot;
+  stats.iterationCount = evidence.iterationCount;
+  stats.cubeToVectorIterations = evidence.cubeToVectorIterations;
+  stats.vectorToCubeIterations = evidence.vectorToCubeIterations;
+  stats.cubeProducerTailCycles = evidence.cubeProducerTailCycles;
+  stats.vectorProducerTailCycles = evidence.vectorProducerTailCycles;
+
+  // The roofline base already assumes simultaneous producer/consumer paths.
+  // A proven cross-path handoff therefore has a two-slot ping-pong reference
+  // depth. With no proven family, one slot is the neutral reference.
+  stats.referenceSlots = stats.workspaceFamilyCount > 0 ? 2 : 1;
+  stats.slotDelta = stats.requestedSlots - stats.referenceSlots;
+  stats.extraSlots = std::max<int64_t>(0, stats.slotDelta);
+  stats.syncPairCycles = config.getSyncOpCycles("set_flag", 1) +
+                         config.getSyncOpCycles("wait_flag", 2);
+  if (stats.workspaceFamilyCount > 0) {
+    stats.syncDeltaCycles = stats.extraSlots * stats.workspaceFamilyCount *
+                            stats.syncPairCycles;
+
+    auto accumulateDirection = [&](int64_t familyCount, int64_t iterations,
+                                   int64_t producerCycles,
+                                   int64_t consumerCycles,
+                                   int64_t producerTailCycles) {
+      if (familyCount <= 0 || iterations <= 0)
+        return;
+      BoundedBufferSchedule requested = scheduleFiniteWorkspaceBuffer(
+          producerCycles, consumerCycles, iterations, stats.requestedSlots,
+          producerTailCycles);
+      BoundedBufferSchedule reference = scheduleFiniteWorkspaceBuffer(
+          producerCycles, consumerCycles, iterations, stats.referenceSlots,
+          producerTailCycles);
+      BoundedBufferSchedule ideal = scheduleFiniteWorkspaceBuffer(
+          producerCycles, consumerCycles, iterations, iterations,
+          producerTailCycles);
+      stats.blockingCycles =
+          std::max(stats.blockingCycles, requested.producerBlockingCycles);
+      stats.referenceBlockingCycles = std::max(
+          stats.referenceBlockingCycles, reference.producerBlockingCycles);
+      stats.queueDeltaCycles = std::max(
+          stats.queueDeltaCycles,
+          std::max<int64_t>(0, requested.makespanCycles - ideal.makespanCycles));
+      stats.referenceQueuePenaltyCycles = std::max(
+          stats.referenceQueuePenaltyCycles,
+          std::max<int64_t>(0, reference.makespanCycles - ideal.makespanCycles));
+    };
+    accumulateDirection(stats.cubeToVectorFamilyCount,
+                        stats.cubeToVectorIterations, cubePathCycles,
+                        vectorPathCycles, stats.cubeProducerTailCycles);
+    accumulateDirection(stats.vectorToCubeFamilyCount,
+                        stats.vectorToCubeIterations, vectorPathCycles,
+                        cubePathCycles, stats.vectorProducerTailCycles);
+    stats.overlapReliefCycles = std::max<int64_t>(
+        0, stats.referenceQueuePenaltyCycles - stats.queueDeltaCycles);
+    stats.producerWaitReliefCycles = std::max<int64_t>(
+        0, stats.referenceBlockingCycles - stats.blockingCycles);
+  }
+
+  stats.netDeltaCycles = stats.syncDeltaCycles + stats.queueDeltaCycles;
+  stats.valid = true;
+  stats.adjustmentApplied = stats.netDeltaCycles != 0;
+  return stats;
+}
+
+TileMixStats estimateTileMix(
     const TileMixParams &params, const PipelineScheduler &scheduler,
     const HardwareConfig &config, int64_t cubePathCycles,
     int64_t vectorPathCycles, int64_t cubeTransferCycles,
     int64_t vectorTransferCycles, int64_t baseCycles) {
-  TileMixBalanceStats stats;
+  TileMixStats stats;
   stats.baseCycles = baseCycles;
   stats.adjustedCycles = baseCycles;
   if (!params.hasAny || !isTileMixDagModelEnabled())
@@ -747,8 +864,6 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
     ubBytes = 256 * 1024;
   TileMixModelConfig model = getTileMixModelConfig(config);
   TileMixDerivedFeatures features = inferTileMixDerivedFeatures(scheduler);
-  WorkspaceMultibufferEvidence multibufferEvidence =
-      inferWorkspaceMultibufferEvidence(scheduler);
   stats.inferredTileM = features.tileM;
   stats.inferredTileN = features.tileN;
   stats.tileShapeSource = features.tileShapeSource;
@@ -759,103 +874,6 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
   stats.handoffDtypeBytes = features.dtypeBytes;
   stats.handoffTileBytes = features.handoffTileBytes;
   stats.intermediateTileBytes = features.intermediateTileBytes;
-  stats.multibufferWorkspaceCount = multibufferEvidence.familyCount;
-  stats.multibufferCubeToVectorFamilyCount =
-      multibufferEvidence.cubeToVectorFamilyCount;
-  stats.multibufferVectorToCubeFamilyCount =
-      multibufferEvidence.vectorToCubeFamilyCount;
-  stats.multibufferWorkspaceBytesPerSlot = multibufferEvidence.bytesPerSlot;
-  stats.multibufferIterationCount = multibufferEvidence.iterationCount;
-  stats.multibufferCubeToVectorIterations =
-      multibufferEvidence.cubeToVectorIterations;
-  stats.multibufferVectorToCubeIterations =
-      multibufferEvidence.vectorToCubeIterations;
-  stats.multibufferCubeProducerTailCycles =
-      multibufferEvidence.cubeProducerTailCycles;
-  stats.multibufferVectorProducerTailCycles =
-      multibufferEvidence.vectorProducerTailCycles;
-  // The roofline base already assumes simultaneous producer/consumer paths.
-  // A proven cross-path handoff therefore has a two-slot ping-pong reference
-  // depth; this is an overlap property, not a restriction on the requested B.
-  // Every positive B is modeled relative to the same semantic reference.
-  stats.multibufferReferenceSlots =
-      stats.multibufferWorkspaceCount > 0 ? 2 : 1;
-  stats.workspaceMultibuffer = params.workspaceMultibufferPresent
-      ? std::max<int64_t>(1, params.workspaceMultibuffer)
-      : stats.multibufferReferenceSlots;
-  stats.multibufferSlotDelta =
-      stats.workspaceMultibuffer - stats.multibufferReferenceSlots;
-  stats.multibufferExtraSlots =
-      std::max<int64_t>(0, stats.multibufferSlotDelta);
-  stats.multibufferSyncPairCycles =
-      config.getSyncOpCycles("set_flag", 1) +
-      config.getSyncOpCycles("wait_flag", 2);
-  // Slot synchronization has a measured linear slope in HIVM: every slot
-  // added to every family introduces one set/wait pair. The TTIR roofline does
-  // not contain a removable sync intercept, so a smaller B cannot claim a
-  // negative cost; only proven additional slots are charged.
-  if (params.workspaceMultibufferPresent &&
-      stats.multibufferWorkspaceCount > 0) {
-    stats.multibufferSyncDeltaCycles =
-        stats.multibufferExtraSlots * stats.multibufferWorkspaceCount *
-        stats.multibufferSyncPairCycles;
-  }
-
-  // Model the benefit without a fitted reward: compare each finite FIFO with
-  // the same static schedule at effectively unlimited capacity. The requested
-  // queue penalty is non-negative and is added above the ideal roofline. A
-  // larger B is beneficial only by reducing that concrete penalty; it never
-  // pushes the result below the ideal max(CubePath, VectorPath) lower bound.
-  if (params.workspaceMultibufferPresent &&
-      stats.multibufferWorkspaceCount > 0) {
-    auto accumulateDirection = [&](int64_t familyCount,
-                                   int64_t iterations,
-                                   int64_t producerCycles,
-                                   int64_t consumerCycles,
-                                   int64_t producerTailCycles) {
-      if (familyCount <= 0 || iterations <= 0)
-        return;
-      BoundedBufferSchedule requested = scheduleFiniteWorkspaceBuffer(
-          producerCycles, consumerCycles, iterations,
-          stats.workspaceMultibuffer, producerTailCycles);
-      BoundedBufferSchedule reference = scheduleFiniteWorkspaceBuffer(
-          producerCycles, consumerCycles, iterations,
-          stats.multibufferReferenceSlots, producerTailCycles);
-      BoundedBufferSchedule ideal = scheduleFiniteWorkspaceBuffer(
-          producerCycles, consumerCycles, iterations, iterations,
-          producerTailCycles);
-      stats.multibufferBlockingCycles = std::max(
-          stats.multibufferBlockingCycles,
-          requested.producerBlockingCycles);
-      stats.multibufferReferenceBlockingCycles = std::max(
-          stats.multibufferReferenceBlockingCycles,
-          reference.producerBlockingCycles);
-      stats.multibufferQueueDeltaCycles = std::max(
-          stats.multibufferQueueDeltaCycles,
-          std::max<int64_t>(0, requested.makespanCycles -
-                                   ideal.makespanCycles));
-      stats.multibufferReferenceQueuePenaltyCycles = std::max(
-          stats.multibufferReferenceQueuePenaltyCycles,
-          std::max<int64_t>(0, reference.makespanCycles -
-                                   ideal.makespanCycles));
-    };
-    accumulateDirection(
-        stats.multibufferCubeToVectorFamilyCount,
-        stats.multibufferCubeToVectorIterations, cubePathCycles,
-        vectorPathCycles, stats.multibufferCubeProducerTailCycles);
-    accumulateDirection(
-        stats.multibufferVectorToCubeFamilyCount,
-        stats.multibufferVectorToCubeIterations, vectorPathCycles,
-        cubePathCycles, stats.multibufferVectorProducerTailCycles);
-    stats.multibufferOverlapReliefCycles = std::max<int64_t>(
-        0, stats.multibufferReferenceQueuePenaltyCycles -
-               stats.multibufferQueueDeltaCycles);
-    stats.multibufferProducerWaitReliefCycles = std::max<int64_t>(
-        0, stats.multibufferReferenceBlockingCycles -
-               stats.multibufferBlockingCycles);
-  }
-  stats.multibufferNetDeltaCycles = stats.multibufferSyncDeltaCycles +
-                                    stats.multibufferQueueDeltaCycles;
 
   int64_t vectorAlignment = std::max<int64_t>(1, config.getVectorWidthBytes());
   TileMixSideDecision cubeDecision;
@@ -937,8 +955,7 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
   bool anyKnownRequestedSide =
       (params.cubeLoop > 1 && cubeDecision.known) ||
       (params.vectorLoop > 1 && vectorDecision.known);
-  bool multibufferRequested = params.workspaceMultibufferPresent;
-  if (!anyKnownRequestedSide && !multibufferRequested)
+  if (!anyKnownRequestedSide)
     return stats;
 
   bool cubeApplied = cubeDecision.applied;
@@ -989,12 +1006,10 @@ TileMixBalanceStats estimateTileMixLoopTilingBalance(
   stats.bufferFitPenaltyCycles = cubeAfterPressure + vectorAfterPressure;
   stats.adjustedCycles = std::max<int64_t>(
       1, baseCycles + stats.gmDeltaCycles + stats.externalSyncDeltaCycles +
-             stats.pipelineDeltaCycles + stats.scalarControlDeltaCycles +
-             stats.multibufferNetDeltaCycles);
+             stats.pipelineDeltaCycles + stats.scalarControlDeltaCycles);
   stats.netDeltaCycles = stats.adjustedCycles - baseCycles;
   stats.valid = true;
-  stats.adjustmentApplied = cubeApplied || vectorApplied ||
-                            stats.multibufferNetDeltaCycles != 0;
+  stats.adjustmentApplied = cubeApplied || vectorApplied;
   return stats;
 }
 
@@ -1251,6 +1266,8 @@ struct PipelineAnalysisPass
     }
 
     TileMixParams tileMixParams = parseTileMixParams(compileParamsStr);
+    WorkspaceMultibufferParams workspaceMultibufferParams =
+        parseWorkspaceMultibufferParams(compileParamsStr);
     
     // Collect loops and ensure trip counts are set
     SmallVector<scf::ForOp> allLoops;
@@ -1368,12 +1385,22 @@ struct PipelineAnalysisPass
         hwUnitCycles[HWUnit::CubeMTE2] + hwUnitCycles[HWUnit::FixPipe];
     int64_t vectorTransferCycles =
         hwUnitCycles[HWUnit::VecMTE2] + hwUnitCycles[HWUnit::MTE3];
-    TileMixBalanceStats tileMixStats = estimateTileMixLoopTilingBalance(
+    TileMixStats tileMixStats = estimateTileMix(
         tileMixParams, scheduler, config, cubePathCycles, vectorPathCycles,
         cubeTransferCycles, vectorTransferCycles, baseRooflineTotalCycles);
-    int64_t rooflineTotalCycles = tileMixStats.valid
-                                      ? tileMixStats.adjustedCycles
-                                      : baseRooflineTotalCycles;
+    WorkspaceMultibufferStats workspaceMultibufferStats =
+        estimateWorkspaceMultibuffer(workspaceMultibufferParams, scheduler,
+                                     config, cubePathCycles,
+                                     vectorPathCycles);
+    int64_t tileMixDeltaCycles =
+        tileMixStats.valid ? tileMixStats.netDeltaCycles : 0;
+    int64_t workspaceMultibufferDeltaCycles =
+        workspaceMultibufferStats.valid
+            ? workspaceMultibufferStats.netDeltaCycles
+            : 0;
+    int64_t rooflineTotalCycles = std::max<int64_t>(
+        1, baseRooflineTotalCycles + tileMixDeltaCycles +
+               workspaceMultibufferDeltaCycles);
     
     // Also calculate simple sum for comparison
     int64_t simpleSumCycles = 0;
@@ -1388,7 +1415,7 @@ struct PipelineAnalysisPass
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), baseRooflineTotalCycles));
     if (tileMixStats.used) {
       module->setAttr("ascend.tile_mix_schedule_model",
-                      StringAttr::get(module.getContext(), "ttir_principle_marginal_cycles_v4_target_trip_finite_multibuffer"));
+                      StringAttr::get(module.getContext(), "ttir_principle_marginal_cycles_v5_target_trip_peer_model"));
       module->setAttr("ascend.tile_mix_model_valid",
                       BoolAttr::get(module.getContext(), tileMixStats.valid));
       module->setAttr("ascend.tile_mix_adjustment_applied",
@@ -1431,50 +1458,60 @@ struct PipelineAnalysisPass
                       IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.pipelineDeltaCycles));
       module->setAttr("ascend.tile_mix_delta_scalar_control_cycles",
                       IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.scalarControlDeltaCycles));
+    }
+    if (workspaceMultibufferStats.used) {
+      module->setAttr("ascend.workspace_multibuffer_schedule_model",
+                      StringAttr::get(module.getContext(), "ttir_finite_fifo_v1"));
+      module->setAttr("ascend.workspace_multibuffer_model_valid",
+                      BoolAttr::get(module.getContext(), workspaceMultibufferStats.valid));
+      module->setAttr("ascend.workspace_multibuffer_adjustment_applied",
+                      BoolAttr::get(module.getContext(), workspaceMultibufferStats.adjustmentApplied));
       module->setAttr("ascend.workspace_multibuffer_slots",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.workspaceMultibuffer));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.requestedSlots));
       module->setAttr("ascend.workspace_multibuffer_reference_slots",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferReferenceSlots));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.referenceSlots));
       module->setAttr("ascend.workspace_multibuffer_slot_delta",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferSlotDelta));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.slotDelta));
       module->setAttr("ascend.workspace_multibuffer_extra_slots",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferExtraSlots));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.extraSlots));
       module->setAttr("ascend.workspace_multibuffer_family_count",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferWorkspaceCount));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.workspaceFamilyCount));
       module->setAttr("ascend.workspace_multibuffer_cube_to_vector_family_count",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferCubeToVectorFamilyCount));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.cubeToVectorFamilyCount));
       module->setAttr("ascend.workspace_multibuffer_vector_to_cube_family_count",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferVectorToCubeFamilyCount));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.vectorToCubeFamilyCount));
       module->setAttr("ascend.workspace_multibuffer_bytes_per_slot",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferWorkspaceBytesPerSlot));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.workspaceBytesPerSlot));
       module->setAttr("ascend.workspace_multibuffer_iteration_count",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferIterationCount));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.iterationCount));
       module->setAttr("ascend.workspace_multibuffer_cube_to_vector_iterations",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferCubeToVectorIterations));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.cubeToVectorIterations));
       module->setAttr("ascend.workspace_multibuffer_vector_to_cube_iterations",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferVectorToCubeIterations));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.vectorToCubeIterations));
       module->setAttr("ascend.workspace_multibuffer_cube_producer_tail_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferCubeProducerTailCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.cubeProducerTailCycles));
       module->setAttr("ascend.workspace_multibuffer_vector_producer_tail_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferVectorProducerTailCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.vectorProducerTailCycles));
       module->setAttr("ascend.workspace_multibuffer_sync_pair_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferSyncPairCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.syncPairCycles));
       module->setAttr("ascend.workspace_multibuffer_delta_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferSyncDeltaCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.syncDeltaCycles));
       module->setAttr("ascend.workspace_multibuffer_blocking_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferBlockingCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.blockingCycles));
       module->setAttr("ascend.workspace_multibuffer_reference_blocking_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferReferenceBlockingCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.referenceBlockingCycles));
       module->setAttr("ascend.workspace_multibuffer_producer_wait_relief_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferProducerWaitReliefCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.producerWaitReliefCycles));
       module->setAttr("ascend.workspace_multibuffer_reference_queue_penalty_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferReferenceQueuePenaltyCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.referenceQueuePenaltyCycles));
       module->setAttr("ascend.workspace_multibuffer_overlap_relief_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferOverlapReliefCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.overlapReliefCycles));
       module->setAttr("ascend.workspace_multibuffer_queue_delta_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferQueueDeltaCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.queueDeltaCycles));
       module->setAttr("ascend.workspace_multibuffer_net_delta_cycles",
-                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.multibufferNetDeltaCycles));
+                      IntegerAttr::get(IntegerType::get(module.getContext(), 64), workspaceMultibufferStats.netDeltaCycles));
+    }
+    if (tileMixStats.used) {
       module->setAttr("ascend.tile_mix_sync_ops_before",
                       IntegerAttr::get(IntegerType::get(module.getContext(), 64), tileMixStats.syncOpsBefore));
       module->setAttr("ascend.tile_mix_sync_ops_after",
@@ -1585,8 +1622,6 @@ struct PipelineAnalysisPass
     if (tileMixStats.used) {
       llvm::outs() << "  Tile mix params: vector_loop=" << tileMixParams.vectorLoop
                    << ", cube_loop=" << tileMixParams.cubeLoop
-                   << ", workspace_multibuffer="
-                   << tileMixParams.workspaceMultibuffer
                    << "\n";
       llvm::outs() << "  Tile mix inferred features: block_m="
                    << tileMixStats.inferredTileM
@@ -1651,50 +1686,62 @@ struct PipelineAnalysisPass
                    << tileMixStats.intermediateTargetBytes
                    << ", neutral_block_m="
                    << tileMixStats.intermediateNeutralBlockM << "\n";
+    }
+    if (workspaceMultibufferStats.used) {
+      llvm::outs() << "  Workspace multibuffer params: requested_slots="
+                   << workspaceMultibufferParams.requestedSlots << "\n";
       llvm::outs() << "  Workspace multibuffer: slots="
-                   << tileMixStats.workspaceMultibuffer
+                   << workspaceMultibufferStats.requestedSlots
                    << ", reference_slots="
-                   << tileMixStats.multibufferReferenceSlots
+                   << workspaceMultibufferStats.referenceSlots
                    << ", slot_delta="
-                   << tileMixStats.multibufferSlotDelta
+                   << workspaceMultibufferStats.slotDelta
                    << ", extra_slots="
-                   << tileMixStats.multibufferExtraSlots
+                   << workspaceMultibufferStats.extraSlots
                    << ", workspace_families="
-                   << tileMixStats.multibufferWorkspaceCount
+                   << workspaceMultibufferStats.workspaceFamilyCount
                    << ", cube_to_vector_families="
-                   << tileMixStats.multibufferCubeToVectorFamilyCount
+                   << workspaceMultibufferStats.cubeToVectorFamilyCount
                    << ", vector_to_cube_families="
-                   << tileMixStats.multibufferVectorToCubeFamilyCount
+                   << workspaceMultibufferStats.vectorToCubeFamilyCount
                    << ", bytes_per_slot="
-                   << tileMixStats.multibufferWorkspaceBytesPerSlot
+                   << workspaceMultibufferStats.workspaceBytesPerSlot
                    << ", iterations="
-                   << tileMixStats.multibufferIterationCount
+                   << workspaceMultibufferStats.iterationCount
                    << ", cube_to_vector_iterations="
-                   << tileMixStats.multibufferCubeToVectorIterations
+                   << workspaceMultibufferStats.cubeToVectorIterations
                    << ", vector_to_cube_iterations="
-                   << tileMixStats.multibufferVectorToCubeIterations
+                   << workspaceMultibufferStats.vectorToCubeIterations
                    << ", cube_producer_tail_cycles="
-                   << tileMixStats.multibufferCubeProducerTailCycles
+                   << workspaceMultibufferStats.cubeProducerTailCycles
                    << ", vector_producer_tail_cycles="
-                   << tileMixStats.multibufferVectorProducerTailCycles
+                   << workspaceMultibufferStats.vectorProducerTailCycles
                    << ", sync_pair_cycles="
-                   << tileMixStats.multibufferSyncPairCycles
+                   << workspaceMultibufferStats.syncPairCycles
                    << ", sync_delta_cycles="
-                   << tileMixStats.multibufferSyncDeltaCycles
+                   << workspaceMultibufferStats.syncDeltaCycles
                    << ", blocking_cycles="
-                   << tileMixStats.multibufferBlockingCycles
+                   << workspaceMultibufferStats.blockingCycles
                    << ", reference_blocking_cycles="
-                   << tileMixStats.multibufferReferenceBlockingCycles
+                   << workspaceMultibufferStats.referenceBlockingCycles
                    << ", producer_wait_relief_cycles="
-                   << tileMixStats.multibufferProducerWaitReliefCycles
+                   << workspaceMultibufferStats.producerWaitReliefCycles
                    << ", reference_queue_penalty_cycles="
-                   << tileMixStats.multibufferReferenceQueuePenaltyCycles
+                   << workspaceMultibufferStats.referenceQueuePenaltyCycles
                    << ", overlap_relief_cycles="
-                   << tileMixStats.multibufferOverlapReliefCycles
+                   << workspaceMultibufferStats.overlapReliefCycles
                    << ", queue_delta_cycles="
-                   << tileMixStats.multibufferQueueDeltaCycles
+                   << workspaceMultibufferStats.queueDeltaCycles
                    << ", net_delta_cycles="
-                   << tileMixStats.multibufferNetDeltaCycles << "\n";
+                   << workspaceMultibufferStats.netDeltaCycles << "\n";
+      llvm::outs() << "  Workspace multibuffer marginal cycles: sync="
+                   << workspaceMultibufferStats.syncDeltaCycles
+                   << ", queue=" << workspaceMultibufferStats.queueDeltaCycles
+                   << ", relief=" << workspaceMultibufferStats.overlapReliefCycles
+                   << ", net=" << workspaceMultibufferStats.netDeltaCycles
+                   << "\n";
+    }
+    if (tileMixStats.used) {
       llvm::outs() << "  Tile mix delta cycles: boundary="
                    << tileMixStats.boundaryCycles
                    << ", balance_penalty="
@@ -1721,16 +1768,11 @@ struct PipelineAnalysisPass
                    << ", buffer=" << tileMixStats.bufferDeltaCycles
                    << ", pipeline=" << tileMixStats.pipelineDeltaCycles
                    << ", scalar_control="
-                   << tileMixStats.scalarControlDeltaCycles
-                   << ", workspace_multibuffer_sync="
-                   << tileMixStats.multibufferSyncDeltaCycles
-                   << ", workspace_multibuffer_queue="
-                   << tileMixStats.multibufferQueueDeltaCycles
-                   << ", workspace_multibuffer_relief="
-                   << tileMixStats.multibufferOverlapReliefCycles
-                   << ", workspace_multibuffer_net="
-                   << tileMixStats.multibufferNetDeltaCycles << "\n";
+                   << tileMixStats.scalarControlDeltaCycles << "\n";
     }
+    llvm::outs() << "  Combined feature model delta cycles: tile_mix="
+                 << tileMixDeltaCycles << ", workspace_multibuffer="
+                 << workspaceMultibufferDeltaCycles << "\n";
     llvm::outs() << "  Roofline model (TTIR principle marginal tile mix): " << rooflineTotalCycles
                  << " (" << llvm::format("%.3f", config.cyclesToMicroseconds(rooflineTotalCycles)) << " us)\n";
     llvm::outs() << "  Speedup from overlap: " << llvm::format("%.2fx", 
