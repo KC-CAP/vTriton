@@ -512,6 +512,8 @@ CostBreakdown UnifiedTilingCostModel::evaluate(
   auto bufferCheck = checkBufferConstraints(op, tiling);
   if (!bufferCheck.valid) {
     result.totalCycles = INT64_MAX;
+    result.bodyCycles = INT64_MAX;
+    result.predictedTotalCycles = INT64_MAX;
     return result;  // Invalid configuration
   }
   
@@ -568,6 +570,29 @@ CostBreakdown UnifiedTilingCostModel::evaluate(
     result.numWaves = numWaves;
     // Scale total cycles: the hardware serialises waves one after another.
     result.totalCycles *= numWaves;
+  }
+  result.bodyCycles = result.totalCycles;
+  {
+    KernelLaunchContext launchCtx;
+    launchCtx.bodyCycles = result.bodyCycles;
+    launchCtx.blockDim = result.numPrograms;
+    launchCtx.usingPrograms = result.numPrograms;
+    launchCtx.numWaves = result.numWaves;
+    launchCtx.hasVector = result.vectorCycles > 0;
+    launchCtx.hasCube = result.cubeCycles > 0;
+    launchCtx.hasMTE = result.hbmAccessCycles > 0;
+    if (launchCtx.hasVector && launchCtx.hasCube)
+      launchCtx.mode = KernelMode::Mix;
+    else if (launchCtx.hasCube)
+      launchCtx.mode = KernelMode::AIC;
+    else if (launchCtx.hasVector)
+      launchCtx.mode = KernelMode::AIV;
+    KernelLaunchEstimate launch =
+        hwConfig.estimateKernelLaunchOverhead(launchCtx);
+    result.launchOverheadCycles = launch.totalCycles;
+    result.predictedTotalCycles =
+        result.bodyCycles + result.launchOverheadCycles;
+    result.totalCycles = result.predictedTotalCycles;
   }
 
   // 7. Derived metrics
@@ -719,6 +744,37 @@ CostBreakdown UnifiedTilingCostModel::evaluateFused(
   
   result.serialCycles = result.hbmAccessCycles + totalCubeCycles + totalVectorCycles;
   result.totalCycles = result.pipelinedCycles;
+  {
+    int64_t numParallelUnits = (result.vectorCycles >= result.cubeCycles)
+                                   ? hwConfig.getNumAIVCores()
+                                   : hwConfig.getNumAICCores();
+    result.numPrograms = result.numTiles;
+    result.numParallelUnits = numParallelUnits;
+    result.numWaves = (result.numPrograms + numParallelUnits - 1) /
+                      std::max<int64_t>(numParallelUnits, 1);
+    result.totalCycles *= std::max<int64_t>(result.numWaves, 1);
+    result.bodyCycles = result.totalCycles;
+    KernelLaunchContext launchCtx;
+    launchCtx.bodyCycles = result.bodyCycles;
+    launchCtx.blockDim = result.numPrograms;
+    launchCtx.usingPrograms = result.numPrograms;
+    launchCtx.numWaves = result.numWaves;
+    launchCtx.hasVector = result.vectorCycles > 0;
+    launchCtx.hasCube = result.cubeCycles > 0;
+    launchCtx.hasMTE = result.hbmAccessCycles > 0;
+    if (launchCtx.hasVector && launchCtx.hasCube)
+      launchCtx.mode = KernelMode::Mix;
+    else if (launchCtx.hasCube)
+      launchCtx.mode = KernelMode::AIC;
+    else if (launchCtx.hasVector)
+      launchCtx.mode = KernelMode::AIV;
+    KernelLaunchEstimate launch =
+        hwConfig.estimateKernelLaunchOverhead(launchCtx);
+    result.launchOverheadCycles = launch.totalCycles;
+    result.predictedTotalCycles =
+        result.bodyCycles + result.launchOverheadCycles;
+    result.totalCycles = result.predictedTotalCycles;
+  }
   
   // CV balance in fusion
   if (totalCubeCycles > 0 && totalVectorCycles > 0) {

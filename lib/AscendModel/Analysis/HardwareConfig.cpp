@@ -10,6 +10,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
@@ -36,6 +37,30 @@ static bool isSyncOpcode(llvm::StringRef opName) {
   return opName == "set_flag" || opName == "wait_flag" ||
          opName == "sync_block_set" || opName == "sync_block_wait" ||
          opName == "sync_block" || opName == "pipe_barrier";
+}
+
+static int64_t microsecondsToCycles(double us, double clockFreqGHz) {
+  return static_cast<int64_t>(std::llround(us * clockFreqGHz * 1000.0));
+}
+
+static llvm::StringRef stringifyKernelMode(KernelMode mode) {
+  switch (mode) {
+  case KernelMode::AIV:
+    return "aiv";
+  case KernelMode::AIC:
+    return "aic";
+  case KernelMode::Mix:
+    return "mix";
+  case KernelMode::SIMD:
+    return "simd";
+  case KernelMode::SIMT:
+    return "simt";
+  case KernelMode::SIMDSIMTMix:
+    return "simd_simt_mix";
+  case KernelMode::Unknown:
+    return "unknown";
+  }
+  return "unknown";
 }
 
 static bool readOpcodeCostObject(const llvm::json::Object &obj,
@@ -591,6 +616,23 @@ std::unique_ptr<HardwareConfig> HardwareConfig::createHardcodedDefault910B() {
   // tilesim-migrated micro-architecture tables (bandwidth/vec/cube).
   config->populateTilesimDefaults910B();
 
+  // Keep the built-in 910B fallback aligned with the JSON 910B3 launch model.
+  // A5/David SIMT targets should provide their own JSON calibration instead of
+  // inheriting these SIMD-oriented constants implicitly.
+  config->numAICCores = 20;
+  config->numAIVCores = 40;
+  config->kernelLaunchOverheadEnabled = true;
+  config->kernelLaunchModel = "fixed_plus_block_dispatch_v1";
+  config->kernelLaunchFixedUs = 1.0;
+  config->kernelLaunchPerBlockUs = 0.04;
+  config->kernelLaunchPerWaveUs = 0.0;
+  config->kernelLaunchSmallKernelThresholdUs = 10.0;
+  config->kernelLaunchModeAdjustUs["aic"] = 0.0;
+  config->kernelLaunchModeAdjustUs["aiv"] = 0.0;
+  config->kernelLaunchModeAdjustUs["mix"] = 0.0;
+  config->kernelLaunchModeAdjustUs["simt"] = 0.0;
+  config->kernelLaunchModeAdjustUs["simd_simt_mix"] = 0.0;
+
   return config;
 }
 
@@ -846,6 +888,38 @@ bool HardwareConfig::parseJSON(const llvm::json::Value &json,
   if (const auto *calibration = root->getObject("calibration")) {
     readCostModelParams(calibration->getObject("cost_model_params"));
     readCostModelParams(calibration->getObject("tilemix_cost_model_params"));
+
+    if (const auto *parallelism = calibration->getObject("parallelism")) {
+      if (auto v = parallelism->getInteger("num_aic_cores"))
+        numAICCores = static_cast<int>(*v);
+      if (auto v = parallelism->getInteger("num_aiv_cores"))
+        numAIVCores = static_cast<int>(*v);
+      if (auto v = parallelism->getNumber("block_launch_overhead_us")) {
+        kernelLaunchPerBlockUs = *v;
+        kernelLaunchOverheadEnabled = *v > 0.0;
+      }
+    }
+
+    if (const auto *launch =
+            calibration->getObject("kernel_launch_overhead")) {
+      kernelLaunchOverheadEnabled = true;
+      if (auto v = launch->getString("model"))
+        kernelLaunchModel = v->str();
+      if (auto v = launch->getNumber("fixed_us"))
+        kernelLaunchFixedUs = *v;
+      if (auto v = launch->getNumber("per_block_us"))
+        kernelLaunchPerBlockUs = *v;
+      if (auto v = launch->getNumber("per_wave_us"))
+        kernelLaunchPerWaveUs = *v;
+      if (auto v = launch->getNumber("small_kernel_body_threshold_us"))
+        kernelLaunchSmallKernelThresholdUs = *v;
+      if (const auto *modeAdjust = launch->getObject("mode_adjust_us")) {
+        for (const auto &kv : *modeAdjust) {
+          if (auto value = kv.second.getAsNumber())
+            kernelLaunchModeAdjustUs[kv.first.str()] = *value;
+        }
+      }
+    }
 
     if (const auto *vecOps =
             calibration->getObject("vector_op_cycles_per_vec_instruction")) {
@@ -1376,13 +1450,11 @@ double HardwareConfig::getAIVScalarOverheadFactor() const {
 }
 
 int HardwareConfig::getNumAICCores() const {
-  // Block Dim = 20 in profiling runs.
-  return 20;
+  return numAICCores;
 }
 
 int HardwareConfig::getNumAIVCores() const {
-  // Mix Block Dim = 40 → 40 AIV cores (2 per AIC block × 20 blocks).
-  return 40;
+  return numAIVCores;
 }
 
 int HardwareConfig::getPipeBarrierCyclesPerIter() const {
@@ -1391,6 +1463,60 @@ int HardwareConfig::getPipeBarrierCyclesPerIter() const {
   //   Active fraction (vec+scalar+mte) = 61.1% → idle = 38.9% = 23 044 cycles
   //   With N_iter = 3 inner iterations → 23 044 / 3 ≈ 7 500 cycles per barrier.
   return 7500;
+}
+
+KernelLaunchEstimate HardwareConfig::estimateKernelLaunchOverhead(
+    const KernelLaunchContext &ctx) const {
+  KernelLaunchEstimate estimate;
+  estimate.enabled = kernelLaunchOverheadEnabled;
+  estimate.model = kernelLaunchModel;
+  if (!kernelLaunchOverheadEnabled)
+    return estimate;
+
+  int64_t blockDim = ctx.blockDim > 0 ? ctx.blockDim : ctx.usingPrograms;
+  estimate.blockDim = blockDim;
+
+  int64_t activeCores = getNumAIVCores();
+  if (ctx.mode == KernelMode::AIC)
+    activeCores = getNumAICCores();
+  else if (ctx.mode == KernelMode::Mix)
+    // A mix kernel can occupy both cube and vector slots.  Use the larger
+    // available parallel launch width; pure cube/vector kernels use their own
+    // core count above.  This keeps the saturation tied to the hardware core
+    // counts in calibration.parallelism instead of a duplicated JSON knob.
+    activeCores = std::max(getNumAICCores(), getNumAIVCores());
+  activeCores = std::max<int64_t>(activeCores, 1);
+
+  int64_t numWaves = ctx.numWaves;
+  if (numWaves <= 0 && blockDim > 0)
+    numWaves = (blockDim + activeCores - 1) / activeCores;
+  estimate.numWaves = numWaves;
+
+  estimate.fixedCycles =
+      microsecondsToCycles(kernelLaunchFixedUs, clockFreqGHz);
+
+  if (blockDim > 0) {
+    int64_t chargedBlocks = std::min(blockDim, activeCores);
+    estimate.blockDispatchCycles =
+        microsecondsToCycles(kernelLaunchPerBlockUs * chargedBlocks,
+                             clockFreqGHz);
+  }
+
+  if (numWaves > 1) {
+    estimate.waveCycles =
+        microsecondsToCycles(kernelLaunchPerWaveUs * (numWaves - 1),
+                             clockFreqGHz);
+  }
+
+  auto modeIt = kernelLaunchModeAdjustUs.find(stringifyKernelMode(ctx.mode));
+  if (modeIt != kernelLaunchModeAdjustUs.end()) {
+    estimate.modeAdjustCycles =
+        microsecondsToCycles(modeIt->second, clockFreqGHz);
+  }
+
+  estimate.totalCycles = estimate.fixedCycles + estimate.blockDispatchCycles +
+                         estimate.waveCycles + estimate.modeAdjustCycles;
+  return estimate;
 }
 
 const DataMover *HardwareConfig::getDataMover(llvm::StringRef name) const {

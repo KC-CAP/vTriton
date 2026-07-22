@@ -195,6 +195,40 @@ struct BandwidthEntry {
   bool isSmallPacket = false;
 };
 
+enum class KernelMode {
+  Unknown,
+  AIV,
+  AIC,
+  Mix,
+  SIMD,
+  SIMT,
+  SIMDSIMTMix
+};
+
+struct KernelLaunchContext {
+  int64_t blockDim = -1;
+  int64_t usingPrograms = -1;
+  int64_t numWaves = -1;
+  KernelMode mode = KernelMode::Unknown;
+  int64_t bodyCycles = 0;
+  size_t opCount = 0;
+  bool hasVector = false;
+  bool hasCube = false;
+  bool hasMTE = false;
+};
+
+struct KernelLaunchEstimate {
+  bool enabled = false;
+  int64_t fixedCycles = 0;
+  int64_t blockDispatchCycles = 0;
+  int64_t waveCycles = 0;
+  int64_t modeAdjustCycles = 0;
+  int64_t totalCycles = 0;
+  int64_t blockDim = -1;
+  int64_t numWaves = -1;
+  std::string model;
+};
+
 class HardwareConfig {
 public:
   HardwareConfig();
@@ -292,6 +326,12 @@ public:
   // idle_cycles ≈ 23 000 cycles / 3 iterations ≈ 7 500 cycles per iteration.
   int getPipeBarrierCyclesPerIter() const;
 
+  KernelLaunchEstimate
+  estimateKernelLaunchOverhead(const KernelLaunchContext &ctx) const;
+  bool isKernelLaunchOverheadEnabled() const {
+    return kernelLaunchOverheadEnabled;
+  }
+
   // Data movers
   const DataMover *getDataMover(llvm::StringRef name) const;
   std::vector<std::string> getDataMoverNames() const;
@@ -387,6 +427,19 @@ private:
 
   // Parallelism info
   llvm::StringMap<bool> parallelismFlags;
+  int numAICCores = 20;
+  int numAIVCores = 40;
+
+  // Kernel launch / device dispatch overhead model.  The fixed term is useful
+  // for reporting absolute latency; the block and wave terms are the parts
+  // that can affect tiling ranking for tiny kernels.
+  bool kernelLaunchOverheadEnabled = false;
+  std::string kernelLaunchModel = "piecewise_linear";
+  double kernelLaunchFixedUs = 0.0;
+  double kernelLaunchPerBlockUs = 0.0;
+  double kernelLaunchPerWaveUs = 0.0;
+  double kernelLaunchSmallKernelThresholdUs = 0.0;
+  llvm::StringMap<double> kernelLaunchModeAdjustUs;
 
   // tilesim-migrated micro-architecture tables.
   // Bandwidth keyed by "src:dst" (costmodel space names: hbm/l2/l1/l0a/l0b/

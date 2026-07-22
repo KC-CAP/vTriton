@@ -13,6 +13,7 @@
 #include "AscendModel/IR/AscendModelInterfaces.h"
 #include "AscendModel/Transforms/Passes.h"
 #include "AscendModel/HardwareConfig.h"
+#include "AscendModel/Analysis/KernelLaunchUtils.h"
 #include "AscendModel/Utils.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -20,6 +21,9 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <algorithm>
+#include <string>
 
 namespace mlir {
 namespace ascend {
@@ -82,6 +86,23 @@ struct RooflineStats {
   }
   
 };
+
+static KernelLaunchContext makeKernelLaunchContext(
+    int64_t bodyCycles, int64_t totalOps, const RooflineStats &stats,
+    llvm::StringRef bindingsStr) {
+  KernelLaunchContext ctx;
+  ctx.bodyCycles = bodyCycles;
+  ctx.opCount = static_cast<size_t>(std::max<int64_t>(totalOps, 0));
+  ctx.hasVector = stats.vectorCycles > 0 || stats.vectorLoadCycles > 0 ||
+                  stats.vectorStoreCycles > 0;
+  ctx.hasCube = stats.cubeCycles > 0 || stats.cubeLoadCycles > 0 ||
+                stats.cubeStoreCycles > 0;
+  ctx.hasMTE = stats.vectorLoadCycles > 0 || stats.vectorStoreCycles > 0 ||
+               stats.cubeLoadCycles > 0 || stats.cubeStoreCycles > 0;
+  utils::inferKernelModeFromLaunchFeatures(ctx);
+  utils::applyKernelLaunchBindings(ctx, bindingsStr);
+  return ctx;
+}
 
 //===----------------------------------------------------------------------===//
 // Pass Implementation
@@ -289,6 +310,20 @@ struct EstimateCyclesPass
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), simpleSumCycles));
     module->setAttr("ascend.total_ops",
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), totalOps));
+    KernelLaunchContext launchCtx =
+        makeKernelLaunchContext(rooflineCycles, totalOps, stats, argBindingsStr);
+    KernelLaunchEstimate launch =
+        config.estimateKernelLaunchOverhead(launchCtx);
+    int64_t predictedTotalCycles = rooflineCycles + launch.totalCycles;
+    module->setAttr("ascend.kernel_body_cycles",
+                    IntegerAttr::get(IntegerType::get(module.getContext(), 64),
+                                     rooflineCycles));
+    module->setAttr("ascend.kernel_launch_overhead_cycles",
+                    IntegerAttr::get(IntegerType::get(module.getContext(), 64),
+                                     launch.totalCycles));
+    module->setAttr("ascend.predicted_total_cycles",
+                    IntegerAttr::get(IntegerType::get(module.getContext(), 64),
+                                     predictedTotalCycles));
     module->setAttr("ascend.hardware",
                     StringAttr::get(module.getContext(), config.getName()));
   }

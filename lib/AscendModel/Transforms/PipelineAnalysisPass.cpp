@@ -11,6 +11,7 @@
 #include "AscendModel/Transforms/Passes.h"
 #include "AscendModel/Analysis/PipelineAnalysis.h"
 #include "AscendModel/HardwareConfig.h"
+#include "AscendModel/Analysis/KernelLaunchUtils.h"
 #include "AscendModel/Utils.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -1054,12 +1055,33 @@ HWUnit getOpHWUnit(Operation *op) {
   return HWUnit::Scalar;
 }
 
+static KernelLaunchContext makeKernelLaunchContext(
+    int64_t bodyCycles, const PipelineScheduler &scheduler,
+    llvm::StringRef bindingsStr) {
+  KernelLaunchContext ctx;
+  ctx.bodyCycles = bodyCycles;
+  ctx.opCount = scheduler.getAllOps().size();
+  for (const PipelineOp &op : scheduler.getAllOps()) {
+    ctx.hasVector |= op.hwUnit == HWUnit::Vector || op.hwUnit == HWUnit::VecMTE2;
+    ctx.hasCube |= op.hwUnit == HWUnit::Cube || op.hwUnit == HWUnit::CubeMTE2 ||
+                   op.hwUnit == HWUnit::FixPipe;
+    ctx.hasMTE |= op.hwUnit == HWUnit::VecMTE2 || op.hwUnit == HWUnit::MTE3 ||
+                  op.hwUnit == HWUnit::CubeMTE2 ||
+                  op.hwUnit == HWUnit::FixPipe;
+  }
+  utils::inferKernelModeFromLaunchFeatures(ctx);
+  utils::applyKernelLaunchBindings(ctx, bindingsStr);
+  return ctx;
+}
+
 /// Generate Perfetto trace with loop unrolling.
 /// If maxIterations > 0, limits the number of iterations shown in trace.
 void generatePerfettoTrace(const PipelineScheduler &scheduler,
                            StringRef filename,
                            int64_t oneIterCycles,
-                           int64_t totalCycles,
+                           int64_t bodyCycles,
+                           int64_t launchOverheadCycles,
+                           int64_t predictedTotalCycles,
                            int64_t maxIterations = 100) {
   std::error_code EC;
   llvm::raw_fd_ostream file(filename, EC, llvm::sys::fs::OF_Text);
@@ -1200,12 +1222,22 @@ void generatePerfettoTrace(const PipelineScheduler &scheduler,
   file << "  \"metadata\": {\n";
   file << "    \"hardware\": \"" << config.getName().str() << "\",\n";
   file << "    \"one_iter_cycles\": " << oneIterCycles << ",\n";
-  file << "    \"total_cycles\": " << totalCycles << ",\n";
+  file << "    \"total_cycles\": " << bodyCycles << ",\n";
+  file << "    \"body_cycles\": " << bodyCycles << ",\n";
+  file << "    \"kernel_launch_overhead_cycles\": "
+       << launchOverheadCycles << ",\n";
+  file << "    \"predicted_total_cycles\": " << predictedTotalCycles << ",\n";
   file << "    \"trace_cycles\": " << traceTotalCycles << ",\n";
   file << "    \"iterations_shown\": " << numIterations << ",\n";
   file << "    \"iterations_total\": " << maxLoopMultiplier << ",\n";
   file << "    \"clock_freq_ghz\": " << config.getClockFrequencyGHz() << ",\n";
-  file << "    \"estimated_time_us\": " << llvm::format("%.3f", config.cyclesToMicroseconds(totalCycles)) << "\n";
+  file << "    \"estimated_time_us\": "
+       << llvm::format("%.3f", config.cyclesToMicroseconds(bodyCycles))
+       << ",\n";
+  file << "    \"predicted_total_time_us\": "
+       << llvm::format("%.3f",
+                       config.cyclesToMicroseconds(predictedTotalCycles))
+       << "\n";
   file << "  },\n";
   
   file << "  \"displayTimeUnit\": \"ns\"\n";
@@ -1222,7 +1254,8 @@ void generatePerfettoTrace(const PipelineScheduler &scheduler,
   if (truncated) {
     llvm::outs() << "partial, ";
   }
-  llvm::outs() << "actual total: " << totalCycles << ")\n";
+  llvm::outs() << "actual body: " << bodyCycles
+               << ", predicted total: " << predictedTotalCycles << ")\n";
   llvm::outs() << "  Open with: https://ui.perfetto.dev/\n";
 }
 
@@ -1406,6 +1439,12 @@ struct PipelineAnalysisPass
     int64_t simpleSumCycles = 0;
     for (const auto &pipelineOp : scheduler.getAllOps())
       simpleSumCycles += pipelineOp.duration * pipelineOp.loopMultiplier;
+
+    KernelLaunchContext launchCtx =
+        makeKernelLaunchContext(rooflineTotalCycles, scheduler, argBindingsStr);
+    KernelLaunchEstimate launch =
+        config.estimateKernelLaunchOverhead(launchCtx);
+    int64_t predictedTotalCycles = rooflineTotalCycles + launch.totalCycles;
     
     module->setAttr("ascend.scheduled_cycles_one_iter",
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), oneIterCycles));
@@ -1413,6 +1452,15 @@ struct PipelineAnalysisPass
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), rooflineTotalCycles));
     module->setAttr("ascend.base_roofline_cycles",
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64), baseRooflineTotalCycles));
+    module->setAttr("ascend.kernel_body_cycles",
+                    IntegerAttr::get(IntegerType::get(module.getContext(), 64),
+                                     rooflineTotalCycles));
+    module->setAttr("ascend.kernel_launch_overhead_cycles",
+                    IntegerAttr::get(IntegerType::get(module.getContext(), 64),
+                                     launch.totalCycles));
+    module->setAttr("ascend.predicted_total_cycles",
+                    IntegerAttr::get(IntegerType::get(module.getContext(), 64),
+                                     predictedTotalCycles));
     if (tileMixStats.used) {
       module->setAttr("ascend.tile_mix_schedule_model",
                       StringAttr::get(module.getContext(), "ttir_principle_marginal_cycles_v5_target_trip_peer_model"));
@@ -1775,6 +1823,22 @@ struct PipelineAnalysisPass
                  << workspaceMultibufferDeltaCycles << "\n";
     llvm::outs() << "  Roofline model (TTIR principle marginal tile mix): " << rooflineTotalCycles
                  << " (" << llvm::format("%.3f", config.cyclesToMicroseconds(rooflineTotalCycles)) << " us)\n";
+    llvm::outs() << "  Kernel launch overhead: " << launch.totalCycles
+                 << " ("
+                 << llvm::format("%.3f",
+                                 config.cyclesToMicroseconds(launch.totalCycles))
+                 << " us)";
+    if (launch.blockDim > 0)
+      llvm::outs() << ", block_dim=" << launch.blockDim;
+    if (launch.numWaves > 0)
+      llvm::outs() << ", waves=" << launch.numWaves;
+    llvm::outs() << "\n";
+    llvm::outs() << "  Predicted total: " << predictedTotalCycles
+                 << " ("
+                 << llvm::format(
+                        "%.3f",
+                        config.cyclesToMicroseconds(predictedTotalCycles))
+                 << " us)\n";
     llvm::outs() << "  Speedup from overlap: " << llvm::format("%.2fx", 
                     static_cast<double>(simpleSumCycles) / std::max(rooflineTotalCycles, 1L)) << "\n";
     
@@ -1787,7 +1851,8 @@ struct PipelineAnalysisPass
     // Replaces the old hard-coded "pipeline_trace.json" cwd write.
     if (!perfettoTraceFile.empty()) {
       generatePerfettoTrace(scheduler, perfettoTraceFile,
-                            oneIterCycles, rooflineTotalCycles);
+                            oneIterCycles, rooflineTotalCycles,
+                            launch.totalCycles, predictedTotalCycles);
     }
 
     // Emit dependency graph JSON for downstream performance bound model consumers

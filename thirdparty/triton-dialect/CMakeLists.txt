@@ -109,12 +109,18 @@ endif()
 # TritonDialectIR (core only, no TritonGPU)
 #===----------------------------------------------------------------------===//
 
-add_library(TritonDialectIR STATIC
+set(_triton_ir_sources
   ${TRITON_IR_LIB_DIR}/Dialect.cpp
   ${TRITON_IR_LIB_DIR}/Ops.cpp
   ${TRITON_IR_LIB_DIR}/Types.cpp
-  ${TRITON_IR_LIB_DIR}/OpInterfaces.cpp
-  ${TRITON_IR_LIB_DIR}/Traits.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/TraitsStub.cpp
+)
+if(EXISTS "${TRITON_IR_LIB_DIR}/OpInterfaces.cpp")
+  list(APPEND _triton_ir_sources ${TRITON_IR_LIB_DIR}/OpInterfaces.cpp)
+endif()
+
+add_library(TritonDialectIR STATIC
+  ${_triton_ir_sources}
 )
 
 add_dependencies(TritonDialectIR TritonDialectIncGen)

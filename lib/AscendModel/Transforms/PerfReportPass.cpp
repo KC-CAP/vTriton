@@ -127,13 +127,24 @@ struct PerfReportPass
       totalCycles += cycles;
     });
     
-    // Prefer the loop-multiplied scheduled summary; fall back to the roofline
-    // summary (also loop-multiplied) before the raw per-op sum (back-port of
-    // triton-ascend #608 — avoids under-counting loop-heavy kernels).
+    // Prefer the end-to-end prediction when launch overhead has been modeled.
+    // Fall back to the loop-multiplied scheduled/roofline summaries before the
+    // raw per-op sum.
+    auto predictedCyclesAttr = module->getAttrOfType<IntegerAttr>("ascend.predicted_total_cycles");
+    auto kernelBodyCyclesAttr = module->getAttrOfType<IntegerAttr>("ascend.kernel_body_cycles");
+    auto kernelLaunchCyclesAttr =
+        module->getAttrOfType<IntegerAttr>("ascend.kernel_launch_overhead_cycles");
     auto scheduledCyclesAttr = module->getAttrOfType<IntegerAttr>("ascend.scheduled_cycles");
     auto rooflineCyclesAttr = module->getAttrOfType<IntegerAttr>("ascend.roofline_cycles");
-    int64_t scheduledCycles = scheduledCyclesAttr ? scheduledCyclesAttr.getInt()
-                                                   : (rooflineCyclesAttr ? rooflineCyclesAttr.getInt() : totalCycles);
+    int64_t scheduledCycles =
+        predictedCyclesAttr
+            ? predictedCyclesAttr.getInt()
+            : (scheduledCyclesAttr
+                   ? scheduledCyclesAttr.getInt()
+                   : (rooflineCyclesAttr ? rooflineCyclesAttr.getInt()
+                                         : totalCycles));
+    bool hasLaunchBreakdown =
+        predictedCyclesAttr && kernelBodyCyclesAttr && kernelLaunchCyclesAttr;
     
       // Ascend 910B clock: 1.85 GHz = 1850 cycles/us
     constexpr double CYCLES_PER_US = 1850.0;
@@ -164,6 +175,12 @@ struct PerfReportPass
     os << "|  Timing Summary                                              |\n";
     os << "|  --------------                                              |\n";
     os << llvm::format("|  Total Cycles:        %12ld                        |\n", scheduledCycles);
+    if (hasLaunchBreakdown) {
+      os << llvm::format("|  Kernel Body Cycles:  %12ld                        |\n",
+                         kernelBodyCyclesAttr.getInt());
+      os << llvm::format("|  Launch Cycles:       %12ld                        |\n",
+                         kernelLaunchCyclesAttr.getInt());
+    }
     os << llvm::format("|  Estimated Time:      %12.3f us                     |\n", timeUs);
     os << "|                                                              |\n";
     os << "|  Compute Summary                                             |\n";

@@ -339,6 +339,23 @@
                                             "block_launch_overhead_us":  0.12,
                                             "description":  "Block overhead verified via chunk_kda: (111,892 - 111,384) / 4096 = 0.12 us/block."
                                         },
+                        "kernel_launch_overhead":  {
+                                                       "target_metric":  "msprof_task_duration",
+                                                       "model":  "fixed_plus_block_dispatch_v1",
+                                                       "fixed_us":  1.0,
+                                                       "per_block_us":  0.04,
+                                                       "per_wave_us":  0.0,
+                                                       "small_kernel_body_threshold_us":  10.0,
+                                                       "mode_adjust_us":  {
+                                                                              "aiv":  0.0,
+                                                                              "aic":  0.0,
+                                                                              "mix":  0.0,
+                                                                              "simd":  0.0,
+                                                                              "simt":  0.0,
+                                                                              "simd_simt_mix":  0.0
+                                                                          },
+                                                       "description":  "Initial tiny-kernel calibration from problematic_configs block_dim sweep: fixed 1.0 us + 0.04 us/block. The per-block term is saturated by calibration.parallelism num_aic_cores/num_aiv_cores according to kernel mode."
+                                                   },
                         "sync_op_cycles":  {
                                                "set_flag":  100,
                                                "wait_flag":  250,

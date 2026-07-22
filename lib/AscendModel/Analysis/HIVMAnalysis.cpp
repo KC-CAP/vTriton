@@ -40,6 +40,7 @@
 #include <cctype>
 #include <cstring>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <queue>
@@ -1905,6 +1906,112 @@ static std::map<std::string, int64_t> parseArgBindings(llvm::StringRef bindings)
   return result;
 }
 
+static std::map<std::string, std::string>
+parseStringArgBindings(llvm::StringRef bindings) {
+  std::map<std::string, std::string> result;
+  llvm::SmallVector<llvm::StringRef, 8> entries;
+  bindings.split(entries, ',', -1, false);
+  for (llvm::StringRef entry : entries) {
+    auto kv = trim(entry).split('=');
+    if (kv.first.empty() || kv.second.empty())
+      continue;
+    result[trim(kv.first).str()] = trim(kv.second).str();
+  }
+  return result;
+}
+
+static int64_t getBindingOr(const std::map<std::string, int64_t> &bindings,
+                            std::initializer_list<llvm::StringRef> keys,
+                            int64_t fallback = -1) {
+  for (llvm::StringRef key : keys) {
+    auto it = bindings.find(key.str());
+    if (it != bindings.end())
+      return it->second;
+  }
+  return fallback;
+}
+
+static KernelMode parseKernelModeForLaunch(llvm::StringRef mode) {
+  if (mode.equals_insensitive("aiv") || mode.equals_insensitive("vector"))
+    return KernelMode::AIV;
+  if (mode.equals_insensitive("simd"))
+    return KernelMode::SIMD;
+  if (mode.equals_insensitive("aic") || mode.equals_insensitive("cube"))
+    return KernelMode::AIC;
+  if (mode.equals_insensitive("mix"))
+    return KernelMode::Mix;
+  if (mode.equals_insensitive("simt"))
+    return KernelMode::SIMT;
+  if (mode.equals_insensitive("simd_simt_mix"))
+    return KernelMode::SIMDSIMTMix;
+  return KernelMode::Unknown;
+}
+
+static KernelMode inferKernelModeForLaunch(const HIVMAnalysisReport &report) {
+  bool hasAIC = false;
+  bool hasAIV = false;
+  for (const HIVMOp &op : report.operations) {
+    llvm::StringRef coreType(op.coreType);
+    if (coreType.contains_insensitive("AIC") ||
+        op.pipe == HIVMPipe::Cube || op.pipe == HIVMPipe::CubeMTE2 ||
+        op.pipe == HIVMPipe::FixPipe || op.pipe == HIVMPipe::MTE1)
+      hasAIC = true;
+    if (coreType.contains_insensitive("AIV") ||
+        op.pipe == HIVMPipe::Vector || op.pipe == HIVMPipe::VectorMTE2 ||
+        op.pipe == HIVMPipe::MTE3)
+      hasAIV = true;
+  }
+  if (hasAIC && hasAIV)
+    return KernelMode::Mix;
+  if (hasAIC)
+    return KernelMode::AIC;
+  if (hasAIV)
+    return KernelMode::AIV;
+  return KernelMode::Unknown;
+}
+
+static void applyKernelLaunchOverhead(
+    HIVMAnalysisReport &report, const HardwareConfig &config,
+    const std::map<std::string, int64_t> &bindings,
+    llvm::StringRef rawBindings) {
+  report.bodyCycles = report.weightedCycles;
+  KernelLaunchContext ctx;
+  ctx.bodyCycles = report.bodyCycles;
+  ctx.opCount = report.opCount;
+  ctx.blockDim = getBindingOr(
+      bindings, {"block_dim", "blockDim", "block_num", "blockNum"});
+  ctx.usingPrograms = getBindingOr(
+      bindings, {"using_programs", "usingPrograms", "num_programs",
+                 "numPrograms"});
+  ctx.numWaves = getBindingOr(bindings, {"num_waves", "numWaves"});
+  ctx.mode = inferKernelModeForLaunch(report);
+  auto stringBindings = parseStringArgBindings(rawBindings);
+  auto modeIt = stringBindings.find("kernel_mode");
+  if (modeIt != stringBindings.end()) {
+    KernelMode explicitMode = parseKernelModeForLaunch(modeIt->second);
+    if (explicitMode != KernelMode::Unknown)
+      ctx.mode = explicitMode;
+  }
+  for (const HIVMOp &op : report.operations) {
+    ctx.hasVector |= op.pipe == HIVMPipe::Vector ||
+                     op.pipe == HIVMPipe::VectorMTE2;
+    ctx.hasCube |= op.pipe == HIVMPipe::Cube ||
+                   op.pipe == HIVMPipe::CubeMTE2 ||
+                   op.pipe == HIVMPipe::FixPipe || op.pipe == HIVMPipe::MTE1;
+    ctx.hasMTE |= op.pipe == HIVMPipe::VectorMTE2 ||
+                  op.pipe == HIVMPipe::CubeMTE2 ||
+                  op.pipe == HIVMPipe::MTE3 ||
+                  op.pipe == HIVMPipe::FixPipe || op.pipe == HIVMPipe::MTE1;
+  }
+
+  KernelLaunchEstimate launch = config.estimateKernelLaunchOverhead(ctx);
+  report.kernelLaunchOverheadCycles = launch.totalCycles;
+  report.predictedTotalCycles = report.bodyCycles + launch.totalCycles;
+  report.kernelLaunchBlockDim = launch.blockDim;
+  report.kernelLaunchNumWaves = launch.numWaves;
+  report.kernelLaunchModel = launch.model;
+}
+
 static bool isZeroCostOp(llvm::StringRef opName) {
   return opName == "pointer_cast" || opName == "convert_layout";
 }
@@ -3281,6 +3388,7 @@ static bool analyzeSemanticHivmBuffer(llvm::StringRef buffer,
   if (report.operations.empty())
     return false;
   finalizeSemanticReport(report, config, schedulerMode);
+  applyKernelLaunchOverhead(report, config, state.argBindings, argBindings);
   return true;
 }
 
@@ -3984,6 +4092,7 @@ bool HIVMAnalyzer::analyzeModule(mlir::ModuleOp module,
     finalizeDiscreteEventReport(report, config);
   else
     finalizeScheduledReport(report, config);
+  applyKernelLaunchOverhead(report, config, state.argBindings, argBindingsStr);
   return true;
 }
 
@@ -4007,6 +4116,24 @@ void HIVMAnalysisReport::print(llvm::raw_ostream &os,
      << " us)\n";
   os << "  Weighted pipe max: " << weightedCycles << " cycles ("
      << llvm::format("%.3f", config.cyclesToMicroseconds(weightedCycles))
+     << " us)\n";
+  os << "  Kernel body: " << bodyCycles << " cycles ("
+     << llvm::format("%.3f", config.cyclesToMicroseconds(bodyCycles))
+     << " us)\n";
+  os << "  Kernel launch overhead: " << kernelLaunchOverheadCycles
+     << " cycles ("
+     << llvm::format("%.3f",
+                     config.cyclesToMicroseconds(kernelLaunchOverheadCycles))
+     << " us)";
+  if (kernelLaunchBlockDim > 0)
+    os << ", block_dim=" << kernelLaunchBlockDim;
+  if (kernelLaunchNumWaves > 0)
+    os << ", waves=" << kernelLaunchNumWaves;
+  if (!kernelLaunchModel.empty())
+    os << ", model=" << kernelLaunchModel;
+  os << "\n";
+  os << "  Predicted total: " << predictedTotalCycles << " cycles ("
+     << llvm::format("%.3f", config.cyclesToMicroseconds(predictedTotalCycles))
      << " us)\n";
   os << "  Sync cycles: " << syncCycles << "\n";
   os << "  Sync issue cycles: " << syncIssueCycles << "\n";
@@ -4418,6 +4545,27 @@ void HIVMAnalysisReport::emitDESGraph(llvm::raw_ostream &os,
      << jsonEscape(config.getOpcodeCalibrationVersion()) << "\",\n";
   os << "  \"opcode_calibration_path\": \""
      << jsonEscape(config.getOpcodeCalibrationPath()) << "\",\n";
+  os << "  \"latency_summary\": {\n";
+  os << "    \"body_cycles\": " << bodyCycles << ",\n";
+  os << "    \"body_time_us\": "
+     << llvm::format("%.6f", config.cyclesToMicroseconds(bodyCycles))
+     << ",\n";
+  os << "    \"kernel_launch_overhead_cycles\": "
+     << kernelLaunchOverheadCycles << ",\n";
+  os << "    \"kernel_launch_overhead_us\": "
+     << llvm::format(
+            "%.6f", config.cyclesToMicroseconds(kernelLaunchOverheadCycles))
+     << ",\n";
+  os << "    \"predicted_total_cycles\": " << predictedTotalCycles << ",\n";
+  os << "    \"predicted_total_time_us\": "
+     << llvm::format("%.6f",
+                     config.cyclesToMicroseconds(predictedTotalCycles))
+     << ",\n";
+  os << "    \"kernel_launch_block_dim\": " << kernelLaunchBlockDim << ",\n";
+  os << "    \"kernel_launch_num_waves\": " << kernelLaunchNumWaves << ",\n";
+  os << "    \"kernel_launch_model\": \"" << jsonEscape(kernelLaunchModel)
+     << "\"\n";
+  os << "  },\n";
   os << "  \"calibration_summary\": {\n";
   os << "    \"calibrated_ops\": " << calibratedOpCount << ",\n";
   os << "    \"heuristic_ops\": " << heuristicOpCount << ",\n";

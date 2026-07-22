@@ -145,6 +145,51 @@
           "type": "object",
           "description": "Alias for tilemix-specific cost-model coefficients",
           "additionalProperties": { "type": "number" }
+        },
+        "parallelism": {
+          "type": "object",
+          "description": "Hardware parallelism and legacy launch-dispatch calibration",
+          "properties": {
+            "num_aic_cores": { "type": "integer", "minimum": 1 },
+            "num_aiv_cores": { "type": "integer", "minimum": 1 },
+            "block_launch_overhead_us": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Legacy per-block launch overhead fallback"
+            }
+          },
+          "additionalProperties": true
+        },
+        "kernel_launch_overhead": {
+          "type": "object",
+          "description": "Kernel-level launch/dispatch overhead added to TTIR and HIVM predictions",
+          "properties": {
+            "target_metric": {
+              "type": "string",
+              "description": "Profiling metric this calibration targets, e.g. msprof_task_duration"
+            },
+            "model": {
+              "type": "string",
+              "description": "Launch model family, e.g. fixed_plus_block_dispatch_v1"
+            },
+            "fixed_us": { "type": "number", "minimum": 0 },
+            "per_block_us": { "type": "number", "minimum": 0 },
+            "per_wave_us": { "type": "number", "minimum": 0 },
+            "small_kernel_body_threshold_us": { "type": "number", "minimum": 0 },
+            "mode_adjust_us": {
+              "type": "object",
+              "description": "Optional per-kernel-mode adjustment; A5/David SIMT should be calibrated independently",
+              "properties": {
+                "aic": { "type": "number" },
+                "aiv": { "type": "number" },
+                "mix": { "type": "number" },
+                "simt": { "type": "number" },
+                "simd_simt_mix": { "type": "number" }
+              },
+              "additionalProperties": { "type": "number" }
+            }
+          },
+          "additionalProperties": true
         }
       },
       "additionalProperties": true

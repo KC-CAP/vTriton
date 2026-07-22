@@ -118,6 +118,12 @@ struct HIVMAnalysisReport {
   HIVMSchedulerMode schedulerMode = HIVMSchedulerMode::Static;
   int64_t oneIterationCycles = 0;
   int64_t weightedCycles = 0;
+  int64_t bodyCycles = 0;
+  int64_t kernelLaunchOverheadCycles = 0;
+  int64_t predictedTotalCycles = 0;
+  int64_t kernelLaunchBlockDim = -1;
+  int64_t kernelLaunchNumWaves = -1;
+  std::string kernelLaunchModel;
   int64_t totalBusyCycles = 0;
   int64_t syncCycles = 0;
   int64_t syncIssueCycles = 0;
