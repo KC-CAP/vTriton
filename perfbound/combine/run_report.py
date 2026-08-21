@@ -24,7 +24,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from ..extract.hivm_extractor import extract_hivm, HIVMExtract
+from ..analyze.des_event_wait_analyzer import analyze_des_event_wait
+from ..extract.hivm_extractor import extract_hivm, load_loop_diagnostics, HIVMExtract
 from ..extract.dsl_extractor import GridInfo
 from ..calibration.calib_loader import (
     DEFAULT_CALIB_PATH,
@@ -33,7 +34,7 @@ from ..calibration.calib_loader import (
 )
 from ..calibration.constants import CalibrationDB
 from ..model.bounds import compute_bounds
-from .bound_combiner import combine, BoundResult
+from .bound_combiner import combine, worst_case_bound_us, BoundResult
 from .report import KernelReport
 from .two_limit import compute_two_limit, TwoLimitResult
 
@@ -46,7 +47,7 @@ def _parse_grid(grid_str: str) -> tuple[int, ...]:
 
 def _build_grid_info(
     grid_dims: tuple[int, ...],
-    n_cores: int = 20,
+    n_cores: int | None = None,
     occupancy: float = 1.0,
     load_balance: float = 1.0,
 ) -> GridInfo:
@@ -70,7 +71,7 @@ def report_from_desgraph(
     des_json: str | Path,
     grid_dims: tuple[int, ...],
     calib_db: Optional[CalibrationDB] = None,
-    n_cores: int = 20,
+    n_cores: int | None = None,
     occupancy: float = 1.0,
     load_balance: float = 1.0,
     kernel_name: str = "unknown",
@@ -128,6 +129,44 @@ def report_from_desgraph(
     report = KernelReport.from_bound(result, two_limit=two_limit)
     report.merge_calibration(calib_db, str(calibration_source))
 
+    # Loop-resolution diagnostics: surface whether t_bound_us may be loose
+    # due to unresolved (data-dependent) scf.for trip counts, and — when a
+    # sound structural upper-bound estimate is derivable — a clearly
+    # non-primary companion worst-case number. merge_calibration() above
+    # *overwrites* calibration_warnings, so this must run after it.
+    loop_diagnostics = load_loop_diagnostics(des_json)
+    if loop_diagnostics:
+        t_worst_us = worst_case_bound_us(
+            extract, loop_diagnostics, grid_info, calib_db,
+            kernel_name=kernel_name, n_cores=n_cores,
+            total_programs=total_programs,
+        )
+        report.loop_resolution = {
+            "total": loop_diagnostics.get("total", 0),
+            "resolved": loop_diagnostics.get("resolved", 0),
+            "unresolved": loop_diagnostics.get("unresolved", 0),
+            "unresolved_lines": [
+                loop["line"] for loop in loop_diagnostics.get("loops", [])
+                if not loop.get("resolved", True)
+            ],
+            "t_bound_worst_case_us": t_worst_us,
+        }
+        if loop_diagnostics.get("unresolved", 0) > 0:
+            report.calibration_warnings.append(
+                f"{loop_diagnostics.get('unresolved', 0)}/"
+                f"{loop_diagnostics.get('total', 0)} loop(s) have "
+                "data-dependent trip counts that default to "
+                "loop_multiplier=1 (the loop's minimum possible trip "
+                "count) — T_bound may be significantly loose "
+                f"(lines: {report.loop_resolution['unresolved_lines']})."
+            )
+
+    # DES critical-path event-wait attribution (Gap-3 diagnostic — never added
+    # to t_bound). Populated only when the DES graph carries a real critical
+    # path (i.e. was produced with --scheduler des); guarded so a static or
+    # legacy graph yields a clear "not populated" note instead of silent zeros.
+    _apply_des_event_wait(report, des_json)
+
     if op_summary_csv is not None:
         _apply_csv_analysis(
             report, result, op_summary_csv,
@@ -143,7 +182,7 @@ def report_from_npuir(
     grid_dims: tuple[int, ...],
     calib_db: Optional[CalibrationDB] = None,
     hardware_config: str | Path | None = None,
-    n_cores: int = 20,
+    n_cores: int | None = None,
     occupancy: float = 1.0,
     load_balance: float = 1.0,
     kernel_name: str = "unknown",
@@ -307,6 +346,53 @@ def _cli():
     if args.output_json:
         report.to_json(args.output_json)
         print(f"\nJSON written to {args.output_json}")
+
+
+def _apply_des_event_wait(report: KernelReport, des_json: "str | Path") -> None:
+    """Attach DES critical-path event-wait attribution to the report.
+
+    Pure Gap-3 diagnostic: event-wait cycles explain where the elapsed DES
+    critical path went; they are NEVER added to t_bound (spec §2.2/§3). When
+    the graph has no critical path (static-scheduled or pre-feature), records
+    populated=False so the report says so rather than emitting silent zeros.
+    """
+    try:
+        analysis = analyze_des_event_wait(des_json)
+    except Exception as exc:  # malformed/missing DES JSON — non-fatal
+        import sys as _sys
+        print(f"Warning: DES event-wait analysis skipped: {exc}", file=_sys.stderr)
+        return
+
+    cycles_per_us = analysis.clock_ghz * 1000.0
+    populated = analysis.critical_path_elapsed_cycles > 0
+    report.des_event_wait = {
+        "populated": populated,
+        "critical_path_cycles": analysis.critical_path_elapsed_cycles,
+        "critical_path_us": analysis.block_elapsed_us,
+        "critical_path_issue_cycles": analysis.critical_path_issue_cycles,
+        "critical_path_event_wait_cycles": analysis.critical_path_event_wait_cycles,
+        "critical_path_event_wait_us": (
+            analysis.critical_path_event_wait_cycles / cycles_per_us
+            if cycles_per_us > 0 else 0.0
+        ),
+        "full_graph_event_wait_cycles": analysis.full_event_wait_cycles,
+        "top_wait_groups": [
+            {
+                "key": g.key,
+                "ops": g.ops,
+                "wait_cycles": g.wait_cycles,
+                "wait_us": g.wait_cycles / cycles_per_us if cycles_per_us > 0 else 0.0,
+                "max_wait_cycles": g.max_wait_cycles,
+            }
+            for g in analysis.critical_path_wait_top
+        ],
+    }
+    if not populated:
+        report.calibration_warnings.append(
+            "DES critical path is empty (graph was static-scheduled or predates "
+            "the critical-path feature) — event-wait (Gap-3) attribution "
+            "unavailable; regenerate with --scheduler des."
+        )
 
 
 def _apply_csv_analysis(

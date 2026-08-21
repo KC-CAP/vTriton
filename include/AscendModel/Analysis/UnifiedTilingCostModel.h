@@ -200,6 +200,9 @@ struct CostBreakdown {
   
   //=== Final Cost ===//
   int64_t totalCycles = 0;             // Final estimated cycles
+  int64_t bodyCycles = 0;              // Same cost before launch overhead
+  int64_t launchOverheadCycles = 0;    // Kernel launch / block dispatch cost
+  int64_t predictedTotalCycles = 0;    // bodyCycles + launchOverheadCycles
   double operationalIntensity = 0.0;   // FLOPs / byte
   double hardwareUtilization = 0.0;    // Achieved / peak throughput
 };

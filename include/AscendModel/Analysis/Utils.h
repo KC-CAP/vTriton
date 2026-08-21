@@ -16,6 +16,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
+#include <cctype>
 #include <optional>
 #include <variant>
 #include <cstdlib>
@@ -778,8 +779,12 @@ inline llvm::Expected<Bindings> parseBindings(llvm::StringRef input) {
     if (!val.getAsInteger(10, intVal)) {
       bindingVal = BindingValue(intVal);
     }
-    // Try float (contains '.', 'e', or 'E')
-    else if (val.contains('.') || val.contains('e') || val.contains('E')) {
+    // Try float only for numeric-looking values. Plain strings such as
+    // kernel_mode=cube/vector contain 'e' but must remain string bindings.
+    else if ((val.contains('.') || val.contains('e') || val.contains('E')) &&
+             !val.empty() &&
+             (std::isdigit(static_cast<unsigned char>(val.front())) ||
+              val.front() == '+' || val.front() == '-' || val.front() == '.')) {
       std::string valStr = val.str();
       char* endPtr = nullptr;
       double floatVal = std::strtod(valStr.c_str(), &endPtr);
