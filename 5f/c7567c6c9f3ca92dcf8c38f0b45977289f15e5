@@ -1,0 +1,43 @@
+lib/AscendModel/Transforms/PipelineAnalysisPass.cpp
+  s_7c02a1a5b92a74::t_63aef813653018 31,69-72,74-76,79-100,205-239,241-242,260-272,354,359-367,369-376,382-423,429-444,758-784,787-790,794-798,800-804,816-817,819-820,822-823,825-826,831-839,842-843,847,849,859-860,870-871,874-875,932-933,939-948,962-965,971-974,993-995,998-999,1019-1459,1461,1956-1957,2078-2121,2128-2133,2136-2138,2165-2167,2265-2327,2437-2438,2552-2555,2560-2618,2651-2655
+  s_7c02a1a5b92a74::t_d9b452cd0370e5 77,240,273,368,377-380,844,1460,1462-1463
+  s_7c02a1a5b92a74::t_62fae8b434a5be 78,274,381,1464
+tools/CMakeLists.txt
+  s_7c02a1a5b92a74::t_63aef813653018 33
+include/AscendModel/Analysis/Utils.h
+  s_7c02a1a5b92a74::t_63aef813653018 248-298,322-338,340,539-540,553-558,804-831,844-845
+  s_7c02a1a5b92a74::t_d9b452cd0370e5 247,339
+lib/AscendModel/Transforms/ConvertTritonToAscend.cpp
+  s_7c02a1a5b92a74::t_63aef813653018 29-30,90-101,206-209,217,255-258,279,313-315,330,336,394-398
+  s_7c02a1a5b92a74::t_d9b452cd0370e5 102
+  s_7c02a1a5b92a74::t_0890e767a52b30 103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "5fc7567c6c9f3ca92dcf8c38f0b45977289f15e5",
+  "prompts": {},
+  "sessions": {
+    "s_7c02a1a5b92a74": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a58934c2802f389e45f43f0",
+        "model": "deepseek-v4-pro"
+      },
+      "human_author": "lujianzhang <lujianzhang@noreply.gitcode.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "session_id": "6a58934c2802f389e45f43f0",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "runtime_client": "trae-tob-git-ai",
+        "dedupe_key": "6a58934c2802f389e45f43f0:6a8802721e9e7f1e0d306549:afterEdit:74e0cefb",
+        "operation_id": "6a8802721e9e7f1e0d306549",
+        "tool_use_id": "6a8802721e9e7f1e0d306549",
+        "client_type": "ide",
+        "tool_type": "builtin",
+        "external_session_id": "6a58934c2802f389e45f43f0",
+        "source_scene": "agent"
+      }
+    }
+  }
+}
